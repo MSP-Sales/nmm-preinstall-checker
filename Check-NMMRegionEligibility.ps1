@@ -7,27 +7,43 @@
     Three-phase pre-install check to catch the most common NMM deployment blockers
     before the partner starts the Azure Marketplace wizard:
 
-        Phase 0 – Permission check
+        Phase 0 - Permission check
             Verifies the signed-in account holds Subscription Owner AND Entra ID
             Global Administrator. Missing either will cause the install to fail.
 
-        Phase 1 – Resource provider registration
+        Phase 1 - Resource provider registration
             Reports the registration state of the 14 providers NMM requires.
             Pass -RegisterProviders to kick off registration automatically and
             poll until all reach "Registered".
 
-        Phase 2 – Region eligibility
-            Surfaces the Azure regions that offer BOTH:
-              • App Service Plan : Basic Medium (B2), Windows
-              • Azure SQL Database: Standard tier / S1 (DTU)
-            Prints a ranked table and a plain-English recommendation.
+        Phase 2 - Region eligibility
+            Surfaces the Azure regions that offer BOTH resources the NMM Azure
+            Marketplace deployment needs, so an SE can tell a partner on a live call
+            which regions are safe to pick in the deployment wizard:
 
-    IMPORTANT CAVEAT (App Service): `az appservice list-locations` reports where the B2
-    SKU is *offered*, not live capacity. The "No availability of Basic VM SKU app service
-    quota" error can still occasionally hit an offered region when Microsoft is capacity-
-    constrained. There is no public API to pre-check live App Service capacity. If a
-    deploy fails in an "Eligible" region, switch to another eligible region or open an
-    Azure support request to lift the App Service quota in that region.
+                1. App Service Plan  : Basic Medium (B2), Windows  <- "Basic VM SKU app service quota" pain point
+                2. Azure SQL Database: Standard tier / S1 (DTU)     <- "can't deploy managed SQL" pain point
+
+            The script cross-references the two and prints a clean table plus a
+            plain-English "these are the regions you could select" summary line,
+            and explains why each excluded region was rejected. Optionally writes a CSV.
+
+    AVAILABILITY vs. QUOTA -- READ THIS:
+    This tool reports whether each SKU is AVAILABLE / OFFERED to the subscription in a
+    region. It does NOT (and cannot) confirm the subscription has the QUOTA HEADROOM to
+    actually provision it. The Azure Quota API (Microsoft.Quota) does not cover App
+    Service (Microsoft.Web) or Azure SQL, so live quota for these two resources cannot be
+    pre-checked via any public API -- it is only enforced at deploy time and raised via a
+    support request. So "Eligible" here means "both SKUs are available in the region," not
+    "guaranteed to deploy." If a deploy fails on a quota/capacity error in an Eligible
+    region, either pick another Eligible region or open an Azure support request
+    (issue type: "Service and subscription limits (quotas)") for that region.
+
+.PARAMETER Geography
+    Optional. Limits the check to one geography so you don't have to know region slugs.
+    Accepts: US, Canada, NorthAmerica, Europe, UK, AsiaPacific, MiddleEast, Africa,
+    SouthAmerica, All. If neither -Geography nor -Regions is supplied and the session is
+    interactive, the script prompts with a menu ("Where is the partner located?").
 
 .PARAMETER AppServiceSku
     App Service plan SKU to test. Default B2 (NMM default, Windows). Accepts B1, B2, B3, S1, etc.
@@ -44,13 +60,6 @@
     requested regions are checked for BOTH gates even if App Service excludes them.
     If omitted, the script checks every region that offers the App Service SKU.
 
-.PARAMETER Geography
-    Optional geography filter to limit the check to regions in one part of the world,
-    instead of naming individual region slugs. Accepts (case-insensitive, spaces/hyphens
-    ignored): us, canada, northamerica, europe, uk, asiapacific (apac), australia, india,
-    japan, middleeast, africa, southamerica. Like -Regions, every region in the geography
-    is checked for BOTH gates. Ignored if -Regions is also supplied.
-
 .PARAMETER SubscriptionId
     Optional subscription to target. Defaults to the current `az` context.
 
@@ -58,28 +67,37 @@
     Optional path to write a CSV of the full result table.
 
 .PARAMETER RegisterProviders
-    When set, automatically registers any unregistered required providers and
-    polls until they all reach "Registered" (or ProviderTimeoutMinutes is hit).
-    Without this switch the script reports provider state but makes no changes.
+    When set, Phase 1 automatically registers any unregistered required providers and
+    polls until they all reach "Registered" (or ProviderTimeoutMinutes is hit). Without
+    this switch Phase 1 reports provider state but makes no changes.
 
 .PARAMETER ProviderTimeoutMinutes
-    How long to wait for provider registration to complete. Default 15.
+    How long Phase 1 waits for provider registration to complete. Default 15.
 
 .EXAMPLE
     ./Check-NMMRegionEligibility.ps1
-    Check all App Service B2 regions for Standard/S1 SQL and print eligible regions.
+    Run all three phases; prompt for the partner's geography for the Phase 2 region check.
+
+.EXAMPLE
+    ./Check-NMMRegionEligibility.ps1 -RegisterProviders
+    Also register any missing providers automatically during Phase 1.
+
+.EXAMPLE
+    ./Check-NMMRegionEligibility.ps1 -Geography US
+    Check only US regions (no prompt) -- ideal when the partner just says "we're in the US."
 
 .EXAMPLE
     ./Check-NMMRegionEligibility.ps1 -Regions eastus,eastus2,centralus,westus2 -OutFile result.csv
-    Only check the partner's candidate regions and save a CSV.
-
-.EXAMPLE
-    ./Check-NMMRegionEligibility.ps1 -Geography northamerica
-    Check every Azure region in the US and Canada for both gates.
+    Only check the partner's named regions and save a CSV.
 
 .NOTES
     Run in Azure Cloud Shell (PowerShell mode) -- already authenticated -- or in local
     PowerShell with Azure CLI installed and `az login` completed.
+
+    SQL availability comes from the Microsoft.Sql locations/capabilities REST API, which
+    also returns the human-readable REASON a region is blocked (e.g. provisioning
+    restricted -> open a quota support request). On PowerShell 7+ (Cloud Shell) the
+    per-region SQL checks run in parallel; Windows PowerShell 5.1 runs them sequentially.
 #>
 
 [CmdletBinding()]
@@ -125,6 +143,50 @@ function Write-Banner {
     Write-Host ('=' * 72) -ForegroundColor DarkCyan
 }
 
+function Get-SqlRegionStatus {
+    # Queries the Microsoft.Sql capabilities API for one region and returns whether the
+    # requested edition/SLO can be provisioned -- plus the human-readable REASON when it
+    # can't (e.g. "Provisioning is restricted in this region..."). Pure/self-contained so
+    # it can be reused inside ForEach-Object -Parallel. Returns: Region, Ok, Reason.
+    param(
+        [string]$Region, [string]$Sub, [string]$Token,
+        [string]$Edition, [string]$Slo, [string]$ApiVersion
+    )
+    $uri = "https://management.azure.com/subscriptions/$Sub/providers/Microsoft.Sql/locations/$Region/capabilities?api-version=$ApiVersion&include=supportedEditions"
+    try {
+        $resp = Invoke-RestMethod -Method GET -Uri $uri -Headers @{ Authorization = "Bearer $Token" } -ErrorAction Stop
+
+        # A populated reason means provisioning is restricted/blocked for this subscription.
+        $reason = $resp.supportedServerVersions.reason | Where-Object { $_ } | Select-Object -First 1
+        if ($reason) { $reason = ($reason -replace '\s+', ' ').Trim() }
+
+        # Is the requested edition + service objective actually offered here?
+        $sloListed = $false
+        foreach ($sv in $resp.supportedServerVersions) {
+            foreach ($e in $sv.supportedEditions) {
+                if ($e.name -eq $Edition) {
+                    foreach ($o in $e.supportedServiceLevelObjectives) {
+                        if ($o.name -eq $Slo) { $sloListed = $true }
+                    }
+                }
+            }
+        }
+
+        if ($reason) {
+            return [pscustomobject]@{ Region = $Region; Ok = $false; Reason = $reason }
+        }
+        elseif ($sloListed) {
+            return [pscustomobject]@{ Region = $Region; Ok = $true;  Reason = '' }
+        }
+        else {
+            return [pscustomobject]@{ Region = $Region; Ok = $false; Reason = "$Edition/$Slo is not offered in this region" }
+        }
+    }
+    catch {
+        return [pscustomobject]@{ Region = $Region; Ok = $false; Reason = "SQL capabilities API error: $($_.Exception.Message)" }
+    }
+}
+
 # --- 0. Pre-flight: az present + authenticated -----------------------------
 if (-not (Get-Command az -ErrorAction SilentlyContinue)) {
     throw "Azure CLI ('az') not found. Run this in Azure Cloud Shell, or install the Azure CLI locally."
@@ -138,8 +200,15 @@ $ctx = az account show --only-show-errors 2>$null | ConvertFrom-Json
 if (-not $ctx) {
     throw "Not logged in to Azure. Run 'az login' (not needed in Cloud Shell) and try again."
 }
+$subId = $ctx.id
 
-Write-Banner "Nerdio Manager for MSP (NMM) - Region Eligibility Check"
+# ARM bearer token for the SQL capabilities REST API (gives the per-region "reason").
+$token = az account get-access-token --query accessToken -o tsv 2>$null
+if (-not $token) {
+    throw "Could not acquire an Azure access token ('az account get-access-token' failed)."
+}
+
+Write-Banner "Nerdio Manager for MSP (NMM) - Pre-Install Readiness Check"
 Write-Host ("Subscription : {0}" -f $ctx.name)
 Write-Host ("Sub ID       : {0}" -f $ctx.id)
 Write-Host ("Checking for : App Service '{0}'  +  Azure SQL '{1}/{2}'" -f $AppServiceSku, $SqlEdition, $SqlServiceObjective)
@@ -150,12 +219,12 @@ Write-Banner "Phase 0: Permission Check"
 
 $me = az ad signed-in-user show --only-show-errors 2>$null | ConvertFrom-Json
 if (-not $me) {
-    Write-Warning "Could not retrieve signed-in user info — permission check skipped. Ensure 'az login' is complete."
+    Write-Warning "Could not retrieve signed-in user info -- permission check skipped. Ensure 'az login' is complete."
 } else {
     Write-Host ("Signed-in user : {0}  ({1})" -f $me.displayName, $me.userPrincipalName)
     Write-Host ''
 
-    # Owner on the subscription — direct, group-inherited, and parent-scope (management group) assignments
+    # Owner on the subscription -- direct, group-inherited, and parent-scope (management group) assignments
     $ownerAssignments = az role assignment list `
         --assignee $me.id `
         --role Owner `
@@ -165,7 +234,7 @@ if (-not $me) {
         --only-show-errors 2>$null | ConvertFrom-Json
     $isOwner = ($null -ne $ownerAssignments -and @($ownerAssignments).Count -gt 0)
 
-    # Global Administrator in Entra ID via Microsoft Graph
+    # Global Administrator in Entra ID via Microsoft Graph.
     # Role template ID 62e90394-... is the well-known GUID for Global Administrator across all tenants.
     $isGA   = $null   # $null = check indeterminate; $true/$false = definitive
     $gaNote = ''
@@ -180,7 +249,7 @@ if (-not $me) {
             $gaNote = ' (no directory roles returned)'
         }
     } catch {
-        $gaNote = ' (Graph API check failed — verify manually)'
+        $gaNote = ' (Graph API check failed -- verify manually)'
     }
 
     $ownerLabel = if ($isOwner) { 'PASS' } else { 'FAIL' }
@@ -219,7 +288,7 @@ foreach ($ns in $NmmRequiredProviders) {
     if (-not $state) { $state = 'UNKNOWN' }
     $providerResults.Add([pscustomobject]@{ Provider = $ns; State = $state })
 }
-$providerResults | Format-Table -AutoSize
+$providerResults | Format-Table -AutoSize | Out-Host
 
 $unregistered = @($providerResults | Where-Object { $_.State -ne 'Registered' })
 
@@ -263,7 +332,10 @@ if ($unregistered.Count -eq 0) {
 }
 Write-Host ''
 
-# --- Phase 2a: Authoritative region map (displayName -> slug) ---------------
+# --- Phase 2: Region eligibility --------------------------------------------
+Write-Banner "Phase 2: Region Eligibility"
+
+# --- 1. Authoritative region map (displayName -> slug) ----------------------
 Write-Host "Loading Azure region list..." -ForegroundColor DarkGray
 $allLocations = az account list-locations --only-show-errors 2>$null | ConvertFrom-Json
 $physical     = $allLocations | Where-Object { $_.metadata.regionType -eq 'Physical' }
@@ -274,6 +346,9 @@ foreach ($loc in $physical) { $nameToSlug[$loc.displayName] = $loc.name }
 # slug -> displayName, for friendly output
 $slugToName = @{}
 foreach ($loc in $physical) { $slugToName[$loc.name] = $loc.displayName }
+# slug -> Azure geographyGroup ("US", "Europe", "Asia Pacific", ...)
+$slugToGeo = @{}
+foreach ($loc in $physical) { $slugToGeo[$loc.name] = $loc.metadata.geographyGroup }
 
 function Resolve-Slug {
     param([string]$DisplayName)
@@ -282,122 +357,166 @@ function Resolve-Slug {
     return ($DisplayName -replace '\s', '').ToLower()
 }
 
-# Map a friendly geography keyword to the region slugs in that part of the world,
-# using the geographyGroup / geography metadata from `az account list-locations`.
-# (Verified against live metadata: geographyGroup values are US, Canada, Mexico,
-# Europe, UK, Asia Pacific, Middle East, Africa, South America.)
-# Returns $null for an unrecognized keyword so the caller can warn and fall back.
-function Resolve-GeographySlugs {
-    param([string]$Geo, $PhysicalLocations)
-    $key = ($Geo -replace '[\s\-_]', '').ToLower()
-    $filter = switch ($key) {
-        'us'            { { $_.metadata.geographyGroup -eq 'US' } }
-        'unitedstates'  { { $_.metadata.geographyGroup -eq 'US' } }
-        'canada'        { { $_.metadata.geographyGroup -eq 'Canada' } }
-        'mexico'        { { $_.metadata.geographyGroup -eq 'Mexico' } }
-        'northamerica'  { { $_.metadata.geographyGroup -in @('US','Canada','Mexico') } }
-        'na'            { { $_.metadata.geographyGroup -in @('US','Canada','Mexico') } }
-        'europe'        { { $_.metadata.geographyGroup -eq 'Europe' } }
-        'eu'            { { $_.metadata.geographyGroup -eq 'Europe' } }
-        'uk'            { { $_.metadata.geographyGroup -eq 'UK' } }
-        'unitedkingdom' { { $_.metadata.geographyGroup -eq 'UK' } }
-        'asiapacific'   { { $_.metadata.geographyGroup -eq 'Asia Pacific' } }
-        'apac'          { { $_.metadata.geographyGroup -eq 'Asia Pacific' } }
-        'asia'          { { $_.metadata.geographyGroup -eq 'Asia Pacific' } }
-        'australia'     { { $_.metadata.geography -eq 'Australia' } }
-        'india'         { { $_.metadata.geography -eq 'India' } }
-        'japan'         { { $_.metadata.geography -eq 'Japan' } }
-        'middleeast'    { { $_.metadata.geographyGroup -eq 'Middle East' } }
-        'africa'        { { $_.metadata.geographyGroup -eq 'Africa' } }
-        'southamerica'  { { $_.metadata.geographyGroup -eq 'South America' } }
-        default         { $null }
-    }
-    if (-not $filter) { return $null }
-    # Exclude canary / staging pseudo-regions (geography "Canary (US)", "Stage (US)") —
-    # they roll up under geographyGroup 'US' but must never be recommended to a partner.
-    return @($PhysicalLocations |
-        Where-Object { $_.metadata.geography -notmatch '\(' } |
-        Where-Object $filter |
-        ForEach-Object { $_.name } | Sort-Object)
+# Friendly geography choice -> set of Azure geographyGroup values.
+# $null means "all regions" (no filter).
+$geoMenu = [ordered]@{
+    'United States'                     = @('US')
+    'Canada'                            = @('Canada')
+    'North America (US + Canada + Mexico)' = @('US', 'Canada', 'Mexico')
+    'Europe (incl. UK)'                 = @('Europe', 'UK')
+    'United Kingdom'                    = @('UK')
+    'Asia Pacific'                      = @('Asia Pacific')
+    'Middle East'                       = @('Middle East')
+    'Africa'                            = @('Africa')
+    'South America'                     = @('South America')
+    'All regions'                       = $null
 }
 
-# --- Phase 2b: App Service regions (Windows; no --linux-workers-enabled flag) ---
+function Resolve-Geography {
+    # Maps a -Geography token (spaces/case-insensitive) to a set of geographyGroup values.
+    param([string]$Token)
+    switch -Regex (($Token -replace '\s', '').ToLower()) {
+        '^(us|usa|unitedstates)$'              { return @('US') }
+        '^canada$'                             { return @('Canada') }
+        '^(northamerica|na)$'                  { return @('US', 'Canada', 'Mexico') }
+        '^(europe|eu)$'                        { return @('Europe', 'UK') }
+        '^(uk|unitedkingdom)$'                 { return @('UK') }
+        '^(asiapacific|apac|asia)$'            { return @('Asia Pacific') }
+        '^(middleeast|me)$'                    { return @('Middle East') }
+        '^africa$'                             { return @('Africa') }
+        '^(southamerica|latam|latinamerica)$'  { return @('South America') }
+        '^(mexico|mx)$'                        { return @('Mexico') }
+        '^all$'                                { return $null }
+        default {
+            throw "Unrecognized -Geography '$Token'. Use one of: US, Canada, NorthAmerica, Europe, UK, AsiaPacific, MiddleEast, Africa, SouthAmerica, Mexico, All."
+        }
+    }
+}
+
+function Show-GeographyPrompt {
+    # Interactive numbered menu. Returns a set of geographyGroup values, or $null for all.
+    Write-Host ''
+    Write-Host "Where is the partner / MSP located? (filters which regions to check)" -ForegroundColor Cyan
+    $labels = @($geoMenu.Keys)
+    for ($n = 0; $n -lt $labels.Count; $n++) {
+        Write-Host ("  {0,2}. {1}" -f ($n + 1), $labels[$n])
+    }
+    try {
+        $pick = Read-Host "Enter choice [1]" -ErrorAction Stop
+    }
+    catch {
+        # Non-interactive host (no console for input): don't guess a geography, scan everything.
+        Write-Host "(no interactive input available -- scanning all regions; pass -Geography to filter)" -ForegroundColor Yellow
+        return $null
+    }
+    if ([string]::IsNullOrWhiteSpace($pick)) { $pick = '1' }
+    $idx = 0
+    if (-not [int]::TryParse($pick, [ref]$idx) -or $idx -lt 1 -or $idx -gt $labels.Count) {
+        Write-Host "Invalid choice; defaulting to United States." -ForegroundColor Yellow
+        $idx = 1
+    }
+    return $geoMenu[$labels[$idx - 1]]
+}
+
+# --- 2. App Service regions (Windows; no --linux-workers-enabled flag) ------
 Write-Host ("Querying App Service regions that offer the '{0}' SKU..." -f $AppServiceSku) -ForegroundColor DarkGray
 $appSvcRaw   = az appservice list-locations --sku $AppServiceSku --only-show-errors 2>$null | ConvertFrom-Json
 $appSvcSlugs = [System.Collections.Generic.HashSet[string]]::new()
 foreach ($r in $appSvcRaw) { [void]$appSvcSlugs.Add( (Resolve-Slug $r.name) ) }
 Write-Host ("  -> {0} regions offer App Service {1}." -f $appSvcSlugs.Count, $AppServiceSku) -ForegroundColor DarkGray
 
-# --- Phase 2c: Determine candidate regions to evaluate ---------------------
+# --- 3. Determine candidate regions to evaluate -----------------------------
+# Precedence: explicit -Regions  >  -Geography  >  interactive prompt  >  all regions.
 if ($Regions) {
-    if ($Geography) {
-        Write-Warning "Both -Regions and -Geography supplied; -Geography is ignored in favor of the explicit -Regions list."
-    }
     $candidates = $Regions | ForEach-Object { $_.Trim().ToLower() } | Where-Object { $_ }
     Write-Host ("Limiting check to {0} requested region(s)." -f $candidates.Count) -ForegroundColor DarkGray
 }
-elseif ($Geography) {
-    $candidates = Resolve-GeographySlugs -Geo $Geography -PhysicalLocations $physical
-    if ($null -eq $candidates) {
-        Write-Warning ("Unrecognized -Geography value '{0}'. Valid values: us, canada, northamerica, europe, uk, asiapacific, australia, india, japan, middleeast, africa, southamerica." -f $Geography)
-        Write-Warning "Falling back to all App Service-eligible regions."
-        $candidates = @($appSvcSlugs) | Sort-Object
+else {
+    $geoGroups = $null      # $null = no filter (all regions)
+    $geoLabel  = 'All regions'
+    if ($Geography) {
+        $geoGroups = Resolve-Geography $Geography
+        $geoLabel  = $Geography
     }
-    else {
-        Write-Host ("Limiting check to {0} region(s) in geography '{1}'." -f $candidates.Count, $Geography) -ForegroundColor DarkGray
+    elseif ([Environment]::UserInteractive) {
+        $geoGroups = Show-GeographyPrompt
+        $geoLabel  = if ($null -eq $geoGroups) { 'All regions' } else { ($geoGroups -join ', ') }
     }
+
+    # A region must offer the App Service SKU to be worth a SQL call; then filter by geography.
+    $candidates = @($appSvcSlugs)
+    if ($null -ne $geoGroups) {
+        $candidates = $candidates | Where-Object { $geoGroups -contains $slugToGeo[$_] }
+    }
+    $candidates = $candidates | Sort-Object
+    Write-Host ''
+    Write-Host ("Checking {0} region(s) in '{1}' for SQL {2}/{3} availability..." -f $candidates.Count, $geoLabel, $SqlEdition, $SqlServiceObjective) -ForegroundColor DarkGray
+}
+
+if (-not $candidates -or @($candidates).Count -eq 0) {
+    Write-Host ''
+    Write-Host "No candidate regions to check (none offer App Service $AppServiceSku in the selected geography)." -ForegroundColor Yellow
+    return
+}
+
+# --- 4. Evaluate SQL availability per candidate (capabilities API) ----------
+# PowerShell 7+ (Azure Cloud Shell) runs the per-region calls in parallel; Windows
+# PowerShell 5.1 falls back to a sequential loop with a progress bar.
+$apiVersion  = '2023-05-01-preview'
+$candidates  = @($candidates)
+$useParallel = ($PSVersionTable.PSVersion.Major -ge 7) -and ($candidates.Count -gt 3)
+
+if ($useParallel) {
+    Write-Host ("  (running {0} SQL checks in parallel)" -f $candidates.Count) -ForegroundColor DarkGray
+    $funcDef = ${function:Get-SqlRegionStatus}.ToString()
+    $sqlResults = $candidates | ForEach-Object -Parallel {
+        ${function:Get-SqlRegionStatus} = $using:funcDef
+        Get-SqlRegionStatus -Region $_ -Sub $using:subId -Token $using:token `
+            -Edition $using:SqlEdition -Slo $using:SqlServiceObjective -ApiVersion $using:apiVersion
+    } -ThrottleLimit 15
 }
 else {
-    # No shortlist: a region must offer App Service B1 to be viable, so only those are worth a SQL call.
-    $candidates = @($appSvcSlugs) | Sort-Object
-    Write-Host ("Checking SQL availability across all {0} App Service-eligible regions (this can take ~1 min)..." -f $candidates.Count) -ForegroundColor DarkGray
+    $sqlResults = New-Object System.Collections.Generic.List[object]
+    $i = 0
+    foreach ($slug in $candidates) {
+        $i++
+        Write-Progress -Activity "Checking SQL availability" -Status $slug -PercentComplete ([int](($i / $candidates.Count) * 100))
+        $sqlResults.Add( (Get-SqlRegionStatus -Region $slug -Sub $subId -Token $token `
+            -Edition $SqlEdition -Slo $SqlServiceObjective -ApiVersion $apiVersion) )
+    }
+    Write-Progress -Activity "Checking SQL availability" -Completed
 }
 
-# --- Phase 2d: Evaluate each candidate (SQL Standard/S1 availability) ------
+# Index SQL results by region, then merge with App Service availability.
+$sqlByRegion = @{}
+foreach ($s in $sqlResults) { $sqlByRegion[$s.Region] = $s }
+
 $results = New-Object System.Collections.Generic.List[object]
-$i = 0
 foreach ($slug in $candidates) {
-    $i++
-    Write-Progress -Activity "Checking SQL availability" -Status $slug -PercentComplete ([int](($i / $candidates.Count) * 100))
-
-    $appOk = $appSvcSlugs.Contains($slug)
-
-    # SQL: --available filters to what is actually deployable in this region for this subscription.
-    $sqlOk = $false
-    try {
-        $editions = az sql db list-editions -l $slug `
-                        --edition $SqlEdition `
-                        --service-objective $SqlServiceObjective `
-                        --available -o json --only-show-errors 2>$null | ConvertFrom-Json
-        if ($editions) {
-            $slo = $editions | ForEach-Object { $_.supportedServiceLevelObjectives } |
-                   Where-Object { $_.name -eq $SqlServiceObjective }
-            $sqlOk = [bool]$slo
-        }
-    }
-    catch {
-        # An invalid region slug or an unsupported location throws; treat as "not available".
-        $sqlOk = $false
-    }
-
-    $display = if ($slugToName.ContainsKey($slug)) { $slugToName[$slug] } else { $slug }
+    $appOk     = $appSvcSlugs.Contains($slug)
+    $sql       = $sqlByRegion[$slug]
+    $sqlOk     = [bool]($sql -and $sql.Ok)
+    $sqlReason = if ($sql) { $sql.Reason } else { 'no SQL result returned' }
+    $display   = if ($slugToName.ContainsKey($slug)) { $slugToName[$slug] } else { $slug }
 
     $results.Add([pscustomobject]@{
-        Region      = $slug
-        DisplayName = $display
-        AppService  = if ($appOk) { 'Yes' } else { 'No' }
-        SqlDb       = if ($sqlOk) { 'Yes' } else { 'No' }
-        Eligible    = if ($appOk -and $sqlOk) { 'YES' } else { 'no' }
+        Region           = $slug
+        DisplayName      = $display
+        AppService       = if ($appOk) { 'Yes' } else { 'No' }
+        SqlDb            = if ($sqlOk) { 'Yes' } else { 'No' }
+        Eligible         = if ($appOk -and $sqlOk) { 'YES' } else { 'no' }
+        SqlReason        = if ($sqlOk) { '' } else { $sqlReason }
+        AppServiceReason = if ($appOk) { '' } else { "App Service $AppServiceSku not offered in this region" }
     })
 }
-Write-Progress -Activity "Checking SQL availability" -Completed
 
-# --- Phase 2e: Output -------------------------------------------------------
+# --- 5. Output --------------------------------------------------------------
 $sorted   = $results | Sort-Object @{E={$_.Eligible -eq 'YES'};Descending=$true}, DisplayName
-$eligible = $sorted | Where-Object { $_.Eligible -eq 'YES' }
+# @() forces array context -- a single Where-Object result is a scalar whose .Count is $null.
+$eligible = @($sorted | Where-Object { $_.Eligible -eq 'YES' })
 
 Write-Banner "Results"
-$sorted | Format-Table -AutoSize
+$sorted | Format-Table Region, DisplayName, AppService, SqlDb, Eligible -AutoSize | Out-Host
 
 Write-Banner "RECOMMENDATION"
 if ($eligible.Count -gt 0) {
@@ -408,15 +527,29 @@ if ($eligible.Count -gt 0) {
 }
 else {
     Write-Host "No checked region offers BOTH App Service $AppServiceSku and SQL $SqlEdition/$SqlServiceObjective." -ForegroundColor Yellow
-    Write-Host "Widen the search (drop -Regions to scan all regions) or consider a different App Service SKU / SQL tier." -ForegroundColor Yellow
+    Write-Host "Widen the search (try -Geography All) or consider a different App Service SKU / SQL tier." -ForegroundColor Yellow
+}
+
+# Explain the excluded regions (the SQL reason is the partner-facing "why").
+$excluded = @($sorted | Where-Object { $_.Eligible -ne 'YES' })
+if ($excluded.Count -gt 0) {
+    Write-Banner "Why these regions were excluded"
+    foreach ($x in $excluded) {
+        Write-Host ("  {0} ({1})" -f $x.DisplayName, $x.Region) -ForegroundColor Yellow
+        if ($x.AppService -eq 'No') { Write-Host ("      App Service : {0}" -f $x.AppServiceReason) -ForegroundColor DarkGray }
+        if ($x.SqlDb -eq 'No')      { Write-Host ("      SQL         : {0}" -f $x.SqlReason)        -ForegroundColor DarkGray }
+    }
 }
 
 Write-Host ''
-Write-Host "Note: App Service availability above reflects where the $AppServiceSku SKU is OFFERED, not live capacity." -ForegroundColor DarkGray
-Write-Host "If a deploy still fails with a Basic quota error in an eligible region, switch to another" -ForegroundColor DarkGray
-Write-Host "eligible region or open an Azure support request to raise the App Service quota there." -ForegroundColor DarkGray
+Write-Host "AVAILABILITY, NOT QUOTA: 'Eligible' means both SKUs are AVAILABLE to provision in the region." -ForegroundColor DarkGray
+Write-Host "For SQL, blocked regions show the reason above (usually a subscription/region provisioning" -ForegroundColor DarkGray
+Write-Host "restriction -- lifted via a quota support request). App Service capacity has NO public pre-check" -ForegroundColor DarkGray
+Write-Host "API, so it can still fail at deploy time even in an Eligible region. Either way: if a deploy fails" -ForegroundColor DarkGray
+Write-Host "on quota/capacity, pick another Eligible region or open an Azure support request (issue type:" -ForegroundColor DarkGray
+Write-Host "'Service and subscription limits (quotas)') for that region." -ForegroundColor DarkGray
 
-# --- Phase 2f: Optional CSV -------------------------------------------------
+# --- 6. Optional CSV --------------------------------------------------------
 if ($OutFile) {
     $sorted | Export-Csv -Path $OutFile -NoTypeInformation -Encoding UTF8
     Write-Host ''
