@@ -12,7 +12,7 @@
             Global Administrator. Missing either will cause the install to fail.
 
         Phase 1 – Resource provider registration
-            Reports the registration state of the 13 providers NMM requires.
+            Reports the registration state of the 14 providers NMM requires.
             Pass -RegisterProviders to kick off registration automatically and
             poll until all reach "Registered".
 
@@ -101,7 +101,8 @@ $NmmRequiredProviders = @(
     'Microsoft.RecoveryServices',
     'Microsoft.Web',
     'Microsoft.Quota',
-    'Microsoft.Solutions'
+    'Microsoft.Solutions',
+    'Microsoft.Sql'
 )
 
 function Write-Banner {
