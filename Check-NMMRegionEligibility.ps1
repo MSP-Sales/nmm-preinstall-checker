@@ -44,6 +44,13 @@
     requested regions are checked for BOTH gates even if App Service excludes them.
     If omitted, the script checks every region that offers the App Service SKU.
 
+.PARAMETER Geography
+    Optional geography filter to limit the check to regions in one part of the world,
+    instead of naming individual region slugs. Accepts (case-insensitive, spaces/hyphens
+    ignored): us, canada, northamerica, europe, uk, asiapacific (apac), australia, india,
+    japan, middleeast, africa, southamerica. Like -Regions, every region in the geography
+    is checked for BOTH gates. Ignored if -Regions is also supplied.
+
 .PARAMETER SubscriptionId
     Optional subscription to target. Defaults to the current `az` context.
 
@@ -66,6 +73,10 @@
     ./Check-NMMRegionEligibility.ps1 -Regions eastus,eastus2,centralus,westus2 -OutFile result.csv
     Only check the partner's candidate regions and save a CSV.
 
+.EXAMPLE
+    ./Check-NMMRegionEligibility.ps1 -Geography northamerica
+    Check every Azure region in the US and Canada for both gates.
+
 .NOTES
     Run in Azure Cloud Shell (PowerShell mode) -- already authenticated -- or in local
     PowerShell with Azure CLI installed and `az login` completed.
@@ -77,6 +88,7 @@ param(
     [string]$SqlEdition          = 'Standard',
     [string]$SqlServiceObjective = 'S1',
     [string[]]$Regions,
+    [string]$Geography,
     [string]$SubscriptionId,
     [string]$OutFile,
     [switch]$RegisterProviders,
@@ -270,6 +282,45 @@ function Resolve-Slug {
     return ($DisplayName -replace '\s', '').ToLower()
 }
 
+# Map a friendly geography keyword to the region slugs in that part of the world,
+# using the geographyGroup / geography metadata from `az account list-locations`.
+# (Verified against live metadata: geographyGroup values are US, Canada, Mexico,
+# Europe, UK, Asia Pacific, Middle East, Africa, South America.)
+# Returns $null for an unrecognized keyword so the caller can warn and fall back.
+function Resolve-GeographySlugs {
+    param([string]$Geo, $PhysicalLocations)
+    $key = ($Geo -replace '[\s\-_]', '').ToLower()
+    $filter = switch ($key) {
+        'us'            { { $_.metadata.geographyGroup -eq 'US' } }
+        'unitedstates'  { { $_.metadata.geographyGroup -eq 'US' } }
+        'canada'        { { $_.metadata.geographyGroup -eq 'Canada' } }
+        'mexico'        { { $_.metadata.geographyGroup -eq 'Mexico' } }
+        'northamerica'  { { $_.metadata.geographyGroup -in @('US','Canada','Mexico') } }
+        'na'            { { $_.metadata.geographyGroup -in @('US','Canada','Mexico') } }
+        'europe'        { { $_.metadata.geographyGroup -eq 'Europe' } }
+        'eu'            { { $_.metadata.geographyGroup -eq 'Europe' } }
+        'uk'            { { $_.metadata.geographyGroup -eq 'UK' } }
+        'unitedkingdom' { { $_.metadata.geographyGroup -eq 'UK' } }
+        'asiapacific'   { { $_.metadata.geographyGroup -eq 'Asia Pacific' } }
+        'apac'          { { $_.metadata.geographyGroup -eq 'Asia Pacific' } }
+        'asia'          { { $_.metadata.geographyGroup -eq 'Asia Pacific' } }
+        'australia'     { { $_.metadata.geography -eq 'Australia' } }
+        'india'         { { $_.metadata.geography -eq 'India' } }
+        'japan'         { { $_.metadata.geography -eq 'Japan' } }
+        'middleeast'    { { $_.metadata.geographyGroup -eq 'Middle East' } }
+        'africa'        { { $_.metadata.geographyGroup -eq 'Africa' } }
+        'southamerica'  { { $_.metadata.geographyGroup -eq 'South America' } }
+        default         { $null }
+    }
+    if (-not $filter) { return $null }
+    # Exclude canary / staging pseudo-regions (geography "Canary (US)", "Stage (US)") —
+    # they roll up under geographyGroup 'US' but must never be recommended to a partner.
+    return @($PhysicalLocations |
+        Where-Object { $_.metadata.geography -notmatch '\(' } |
+        Where-Object $filter |
+        ForEach-Object { $_.name } | Sort-Object)
+}
+
 # --- Phase 2b: App Service regions (Windows; no --linux-workers-enabled flag) ---
 Write-Host ("Querying App Service regions that offer the '{0}' SKU..." -f $AppServiceSku) -ForegroundColor DarkGray
 $appSvcRaw   = az appservice list-locations --sku $AppServiceSku --only-show-errors 2>$null | ConvertFrom-Json
@@ -279,8 +330,22 @@ Write-Host ("  -> {0} regions offer App Service {1}." -f $appSvcSlugs.Count, $Ap
 
 # --- Phase 2c: Determine candidate regions to evaluate ---------------------
 if ($Regions) {
+    if ($Geography) {
+        Write-Warning "Both -Regions and -Geography supplied; -Geography is ignored in favor of the explicit -Regions list."
+    }
     $candidates = $Regions | ForEach-Object { $_.Trim().ToLower() } | Where-Object { $_ }
     Write-Host ("Limiting check to {0} requested region(s)." -f $candidates.Count) -ForegroundColor DarkGray
+}
+elseif ($Geography) {
+    $candidates = Resolve-GeographySlugs -Geo $Geography -PhysicalLocations $physical
+    if ($null -eq $candidates) {
+        Write-Warning ("Unrecognized -Geography value '{0}'. Valid values: us, canada, northamerica, europe, uk, asiapacific, australia, india, japan, middleeast, africa, southamerica." -f $Geography)
+        Write-Warning "Falling back to all App Service-eligible regions."
+        $candidates = @($appSvcSlugs) | Sort-Object
+    }
+    else {
+        Write-Host ("Limiting check to {0} region(s) in geography '{1}'." -f $candidates.Count, $Geography) -ForegroundColor DarkGray
+    }
 }
 else {
     # No shortlist: a region must offer App Service B1 to be viable, so only those are worth a SQL call.
