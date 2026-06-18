@@ -553,7 +553,23 @@ NMM requires an Azure SQL Database Standard S1 (20 DTU, non-Managed-Instance). T
                         }
 
                         # GET the ticket to confirm it exists and retrieve its current status.
-                        $ticket = Invoke-RestMethod -Method GET -Uri $putUri -Headers $restHeaders -ErrorAction Stop
+                        $ticket = $null
+                        try {
+                            $ticket = Invoke-RestMethod -Method GET -Uri $putUri -Headers $restHeaders -ErrorAction Stop
+                        }
+                        catch {
+                            # 404 here means the async op claimed Succeeded but the ticket was never created.
+                            # The most common cause is no paid Azure support plan on the subscription.
+                            $getErrMsg = ($_.ErrorDetails.Message | ConvertFrom-Json -ErrorAction SilentlyContinue).error.message
+                            if ($getErrMsg -match 'does not exist' -or $_.Exception.Message -match '404|Not Found') {
+                                throw [Exception]::new(
+                                    "Ticket was not created. This subscription may not have a paid Azure support plan. " +
+                                    "Ticket creation via API requires Developer tier or higher. " +
+                                    "Use the portal fallback link below to open the ticket manually."
+                                )
+                            }
+                            throw
+                        }
                         Write-Host ("  [OK] {0}  (status: {1})" -f $ticket.name, $ticket.properties.status) -ForegroundColor Green
                         if ($ticket.properties.supportPlanDisplayName) {
                             Write-Host ("       Plan   : {0}" -f $ticket.properties.supportPlanDisplayName) -ForegroundColor DarkGray
