@@ -425,81 +425,74 @@ else {
             Write-Host ("    • {0}  ({1})" -f $_.DisplayName, $_.Region) -ForegroundColor White
         }
 
-        # Ensure the az support extension is installed (not bundled with core CLI).
-        $suppExt = az extension show --name support 2>$null | ConvertFrom-Json
-        if (-not $suppExt) {
-            Write-Host ''
-            $addExt = 'n'
-            try { $addExt = Read-Host "  'az support' extension not installed. Install now? (y/n)" -ErrorAction Stop } catch {}
-            if ($addExt -eq 'y') {
-                Write-Host "  Installing..." -ForegroundColor DarkGray
-                az extension add --name support --only-show-errors
-                $suppExt = az extension show --name support 2>$null | ConvertFrom-Json
-            }
-        }
+        Write-Host ''
+        $doTicket = 'n'
+        try { $doTicket = Read-Host "  File support ticket(s) for these region(s)? (y/n)" -ErrorAction Stop } catch {}
 
-        if (-not $suppExt) {
-            # Graceful fallback: manual portal instructions.
+        if ($doTicket -eq 'y') {
+            # Collect partner contact info once; used for all tickets in this run.
             Write-Host ''
-            Write-Host "  Open tickets manually:" -ForegroundColor Yellow
-            Write-Host "  Portal > Help + Support > New Support Request" -ForegroundColor White
-            Write-Host "  Issue type : Service and subscription limits (quotas)" -ForegroundColor White
-            Write-Host "  Service    : SQL Database" -ForegroundColor White
-            Write-Host ("  Region(s)  : {0}" -f ($sqlTicketable | Select-Object -ExpandProperty DisplayName) -join ', ') -ForegroundColor White
-            Write-Host ("  Sub ID     : {0}" -f $subId) -ForegroundColor White
-        }
-        else {
+            Write-Host "  Partner contact information:" -ForegroundColor Cyan
+            $cFirst = Read-Host "    First name"
+            $cLast  = Read-Host "    Last name"
+            $cEmail = Read-Host "    Email"
+            $cTz    = ''
+            try { $cTz = Read-Host "    Time zone [Pacific Standard Time]" -ErrorAction Stop } catch {}
+            if ([string]::IsNullOrWhiteSpace($cTz)) { $cTz = 'Pacific Standard Time' }
+
+            # Resolve support service + problem classification via the Azure Support REST API.
+            # Uses the same bearer token already acquired for the SQL capabilities check —
+            # no CLI extension required and no hardcoded GUIDs.
+            $supportBase = 'https://management.azure.com'
+            $supportVer  = '2020-04-01'
+            $restHeaders = @{ Authorization = "Bearer $token"; 'Content-Type' = 'application/json' }
+
             Write-Host ''
-            $doTicket = 'n'
-            try { $doTicket = Read-Host "  File support ticket(s) for these region(s)? (y/n)" -ErrorAction Stop } catch {}
-
-            if ($doTicket -eq 'y') {
-                # Collect partner contact info once; used for all tickets in this run.
-                Write-Host ''
-                Write-Host "  Partner contact information:" -ForegroundColor Cyan
-                $cFirst = Read-Host "    First name"
-                $cLast  = Read-Host "    Last name"
-                $cEmail = Read-Host "    Email"
-                $cTz    = ''
-                try { $cTz = Read-Host "    Time zone [Pacific Standard Time]" -ErrorAction Stop } catch {}
-                if ([string]::IsNullOrWhiteSpace($cTz)) { $cTz = 'Pacific Standard Time' }
-
-                # Resolve support service + best-match problem classification at runtime
-                # so no GUIDs are hardcoded. Prefers "Service and subscription limits"
-                # (correct category for provisioning restrictions) over the SQL service.
-                Write-Host ''
-                Write-Host "  Resolving Azure support classification..." -ForegroundColor DarkGray
-                $allSvc = az support services list -o json 2>$null | ConvertFrom-Json
-                $svc    = $allSvc | Where-Object { $_.displayName -match 'Service and subscription limits' } | Select-Object -First 1
+            Write-Host "  Resolving Azure support classification..." -ForegroundColor DarkGray
+            $svc = $null
+            $pc  = $null
+            try {
+                $svcsResp = Invoke-RestMethod -Method GET `
+                    -Uri "$supportBase/providers/Microsoft.Support/services?api-version=$supportVer" `
+                    -Headers $restHeaders -ErrorAction Stop
+                $svc = $svcsResp.value | Where-Object { $_.properties.displayName -match 'Service and subscription limits' } | Select-Object -First 1
                 if (-not $svc) {
-                    $svc  = $allSvc | Where-Object { $_.displayName -match 'SQL Database' -and $_.displayName -notmatch 'Managed Instance' } | Select-Object -First 1
+                    $svc = $svcsResp.value | Where-Object { $_.properties.displayName -match 'SQL Database' -and $_.properties.displayName -notmatch 'Managed Instance' } | Select-Object -First 1
                 }
 
-                $pcId = $null
-                $pc   = $null
                 if ($svc) {
-                    $pcs = az support services problem-classifications list --service-name $svc.name -o json 2>$null | ConvertFrom-Json
-                    # Word-boundary \bSQL\b avoids matching "MySQL", "PostgreSQL", etc.
-                    $pc  = $pcs | Where-Object { $_.displayName -match '\bSQL\b' -and $_.displayName -notmatch 'MySQL|PostgreSQL|MariaDB|Cosmos|Redis' } | Select-Object -First 1
+                    $pcsResp = Invoke-RestMethod -Method GET `
+                        -Uri "$supportBase/providers/Microsoft.Support/services/$($svc.name)/problemClassifications?api-version=$supportVer" `
+                        -Headers $restHeaders -ErrorAction Stop
+                    # \bSQL\b avoids matching "MySQL", "PostgreSQL", etc.
+                    $pc = $pcsResp.value | Where-Object { $_.properties.displayName -match '\bSQL\b' -and $_.properties.displayName -notmatch 'MySQL|PostgreSQL|MariaDB|Cosmos|Redis' } | Select-Object -First 1
                     if (-not $pc) {
-                        $pc = $pcs | Where-Object { $_.displayName -match 'quota|limit|provisioning|region' -and $_.displayName -notmatch 'MySQL|PostgreSQL|MariaDB|Cosmos|Redis' } | Select-Object -First 1
+                        $pc = $pcsResp.value | Where-Object { $_.properties.displayName -match 'quota|limit|provisioning|region' -and $_.properties.displayName -notmatch 'MySQL|PostgreSQL|MariaDB|Cosmos|Redis' } | Select-Object -First 1
                     }
-                    if (-not $pc) { $pc = $pcs | Select-Object -First 1 }
-                    $pcId = if ($pc) { $pc.id } else { $null }
+                    if (-not $pc) { $pc = $pcsResp.value | Select-Object -First 1 }
                 }
+            }
+            catch {
+                Write-Warning ("  Could not resolve support classification: {0}" -f $_.Exception.Message)
+            }
 
-                if (-not $pcId) {
-                    Write-Warning "  Could not resolve a problem classification. Open tickets manually:"
-                    Write-Host   "  Portal > Help + Support > New Support Request" -ForegroundColor Yellow
-                }
-                else {
-                    Write-Host ("  Classification : {0}" -f $pc.displayName) -ForegroundColor DarkGray
-                    Write-Host ''
+            if (-not $svc -or -not $pc) {
+                Write-Host ''
+                Write-Host "  Open tickets manually:" -ForegroundColor Yellow
+                Write-Host "  Portal > Help + Support > New Support Request" -ForegroundColor White
+                Write-Host "  Issue type : Service and subscription limits (quotas)" -ForegroundColor White
+                Write-Host "  Service    : SQL Database" -ForegroundColor White
+                Write-Host ("  Region(s)  : {0}" -f (($sqlTicketable | Select-Object -ExpandProperty DisplayName) -join ', ')) -ForegroundColor White
+                Write-Host ("  Sub ID     : {0}" -f $subId) -ForegroundColor White
+            }
+            else {
+                Write-Host ("  Classification : {0}" -f $pc.properties.displayName) -ForegroundColor DarkGray
+                Write-Host ''
 
-                    foreach ($r in $sqlTicketable) {
-                        $tName  = "nmm-sql-$($r.Region)-$(Get-Date -Format 'yyyyMMddHHmm')"
-                        $tTitle = "SQL Standard S1 provisioning restricted: $($r.DisplayName)"
-                        $tBody  = @"
+                foreach ($r in $sqlTicketable) {
+                    $tName  = "nmm-sql-$($r.Region)-$(Get-Date -Format 'yyyyMMddHHmm')"
+                    $tTitle = "SQL Standard S1 provisioning restricted: $($r.DisplayName)"
+                    $tBody  = @"
 Requesting lift of Azure SQL Standard S1 provisioning restriction for a Nerdio Manager for MSP (NMM) Azure Marketplace deployment.
 
 Subscription : $subId
@@ -508,38 +501,47 @@ API message  : $($r.SqlReason)
 
 NMM requires an Azure SQL Database Standard S1 (20 DTU, non-Managed-Instance). The Microsoft.Sql/locations/capabilities API reports provisioning is restricted in $($r.DisplayName) for this subscription. Please lift the restriction or advise on expected availability.
 "@
-                        Write-Host ("  Filing ticket for {0}..." -f $r.DisplayName) -ForegroundColor DarkGray
-                        $t = az support in-subscription tickets create `
-                            --ticket-name                  $tName `
-                            --title                        $tTitle `
-                            --description                  $tBody `
-                            --problem-classification       $pcId `
-                            --severity                     "minimal" `
-                            --advanced-diagnostic-consent  "Yes" `
-                            --contact-first-name           $cFirst `
-                            --contact-last-name            $cLast `
-                            --contact-email                $cEmail `
-                            --contact-country              "USA" `
-                            --contact-method               "email" `
-                            --contact-language             "en-us" `
-                            --contact-timezone             $cTz `
-                            --only-show-errors -o json | ConvertFrom-Json
-
-                        if ($t -and $t.name) {
-                            Write-Host ("  [OK] {0}  (status: {1})" -f $t.name, $t.status) -ForegroundColor Green
-                            if ($t.supportPlanDisplayName) {
-                                Write-Host ("       Plan : {0}" -f $t.supportPlanDisplayName) -ForegroundColor DarkGray
+                    $ticketPayload = @{
+                        properties = @{
+                            serviceId               = $svc.id
+                            problemClassificationId = $pc.id
+                            title                   = $tTitle
+                            description             = $tBody
+                            severity                = 'minimal'
+                            advancedDiagnosticConsent = 'Yes'
+                            contactDetails          = @{
+                                firstName                = $cFirst
+                                lastName                 = $cLast
+                                primaryEmailAddress      = $cEmail
+                                preferredContactMethod   = 'email'
+                                preferredSupportLanguage = 'en-US'
+                                preferredTimeZone        = $cTz
+                                country                  = 'USA'
                             }
                         }
-                        else {
-                            Write-Warning "  Ticket creation failed (no paid support plan, or az support error above)."
-                            Write-Host   "  Fallback: Portal > Help + Support > New Support Request" -ForegroundColor Yellow
+                    } | ConvertTo-Json -Depth 10
+
+                    Write-Host ("  Filing ticket for {0}..." -f $r.DisplayName) -ForegroundColor DarkGray
+                    try {
+                        $t = Invoke-RestMethod -Method PUT `
+                            -Uri "$supportBase/subscriptions/$subId/providers/Microsoft.Support/supportTickets/$($tName)?api-version=$supportVer" `
+                            -Headers $restHeaders -Body $ticketPayload -ErrorAction Stop
+
+                        Write-Host ("  [OK] {0}  (status: {1})" -f $t.name, $t.properties.status) -ForegroundColor Green
+                        if ($t.properties.supportPlanDisplayName) {
+                            Write-Host ("       Plan : {0}" -f $t.properties.supportPlanDisplayName) -ForegroundColor DarkGray
                         }
                     }
-
-                    Write-Host ''
-                    Write-Host "  Track tickets: https://portal.azure.com/#blade/Microsoft_Azure_Support/HelpAndSupportBlade/manageSupportRequest" -ForegroundColor Cyan
+                    catch {
+                        $errMsg   = $_.ErrorDetails.Message | ConvertFrom-Json -ErrorAction SilentlyContinue
+                        $reason   = if ($errMsg.error.message) { $errMsg.error.message } else { $_.Exception.Message }
+                        Write-Warning ("  Ticket creation failed: {0}" -f $reason)
+                        Write-Host   "  Fallback: Portal > Help + Support > New Support Request" -ForegroundColor Yellow
+                    }
                 }
+
+                Write-Host ''
+                Write-Host "  Track tickets: https://portal.azure.com/#blade/Microsoft_Azure_Support/HelpAndSupportBlade/manageSupportRequest" -ForegroundColor Cyan
             }
         }
     }
