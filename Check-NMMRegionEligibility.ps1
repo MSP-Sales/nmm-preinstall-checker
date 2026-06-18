@@ -74,18 +74,9 @@
 .PARAMETER ProviderTimeoutMinutes
     How long Phase 1 waits for provider registration to complete. Default 15.
 
-.PARAMETER OpenTicket
-    When set, Phase 3 prompts to file Azure support tickets for the SQL regions where the
-    capabilities API returns a provisioning restriction ("open a support request"). Requires
-    a paid Azure support plan (Developer, Standard, or higher) on the subscription.
-
 .EXAMPLE
     ./Check-NMMRegionEligibility.ps1
-    Run all phases; prompt for the partner's geography for the Phase 2 region check.
-
-.EXAMPLE
-    ./Check-NMMRegionEligibility.ps1 -OpenTicket
-    Also offer to file Azure support tickets (Phase 3) for SQL provisioning-restricted regions.
+    Run all three phases; prompt for the partner's geography for the Phase 2 region check.
 
 .EXAMPLE
     ./Check-NMMRegionEligibility.ps1 -RegisterProviders
@@ -119,12 +110,7 @@ param(
     [string]$SubscriptionId,
     [string]$OutFile,
     [switch]$RegisterProviders,
-    [int]$ProviderTimeoutMinutes = 15,
-
-    # When set, prompts to file Azure support tickets for SQL regions where the
-    # capabilities API returns a provisioning restriction ("open a support request").
-    # Requires a paid Azure support plan (Developer, Standard, or higher).
-    [switch]$OpenTicket
+    [int]$ProviderTimeoutMinutes = 15
 )
 
 # NOTE: deliberately NOT 'Stop'. The Azure CLI writes harmless warnings to stderr, and
@@ -562,213 +548,12 @@ Write-Host "restriction -- lifted via a quota support request). App Service capa
 Write-Host "API, so it can still fail at deploy time even in an Eligible region. Either way: if a deploy fails" -ForegroundColor DarkGray
 Write-Host "on quota/capacity, pick another Eligible region or open an Azure support request (issue type:" -ForegroundColor DarkGray
 Write-Host "'Service and subscription limits (quotas)') for that region." -ForegroundColor DarkGray
+Write-Host "A quota / region-unlock request is FREE on ANY plan via the portal (Help + Support > New" -ForegroundColor DarkGray
+Write-Host "Support Request) -- no paid Azure support plan is required for quota requests." -ForegroundColor DarkGray
 
 # --- 6. Optional CSV --------------------------------------------------------
 if ($OutFile) {
     $sorted | Export-Csv -Path $OutFile -NoTypeInformation -Encoding UTF8
     Write-Host ''
     Write-Host ("Full result table written to: {0}" -f $OutFile) -ForegroundColor Cyan
-}
-
-# --- 7. Support Ticket Filing (pass -OpenTicket to enable) ------------------
-# Targets SQL-blocked regions where the capabilities API says to open a support
-# request. One ticket per region (each restriction is subscription+region-specific).
-# Runs in the partner's Cloud Shell / subscription context on their behalf.
-
-$sqlTicketable = @($excluded | Where-Object {
-    $_.SqlDb -eq 'No' -and $_.SqlReason -match 'support.?request|provisioning is restricted'
-})
-
-if (-not $OpenTicket) {
-    if ($sqlTicketable.Count -gt 0) {
-        Write-Host ''
-        Write-Host ("TIP: {0} region(s) above have SQL provisioning restrictions that can be lifted via a support ticket." -f $sqlTicketable.Count) -ForegroundColor DarkYellow
-        Write-Host "     Re-run with -OpenTicket to file them automatically from Cloud Shell." -ForegroundColor DarkYellow
-    }
-}
-else {
-    Write-Banner "Phase 3 — Support Ticket Filing"
-
-    if ($sqlTicketable.Count -eq 0) {
-        Write-Host ''
-        Write-Host "  No SQL provisioning restrictions found — nothing to ticket." -ForegroundColor DarkGray
-    }
-    else {
-        Write-Host ''
-        Write-Host ("  {0} region(s) with SQL provisioning restrictions:" -f $sqlTicketable.Count) -ForegroundColor Yellow
-        $sqlTicketable | ForEach-Object {
-            Write-Host ("    • {0}  ({1})" -f $_.DisplayName, $_.Region) -ForegroundColor White
-        }
-
-        Write-Host ''
-        $doTicket = 'n'
-        try { $doTicket = Read-Host "  File support ticket(s) for these region(s)? (y/n)" -ErrorAction Stop } catch {}
-
-        if ($doTicket -eq 'y') {
-            # Collect partner contact info once; used for all tickets in this run.
-            Write-Host ''
-            Write-Host "  Partner contact information:" -ForegroundColor Cyan
-            $cFirst = Read-Host "    First name"
-            $cLast  = Read-Host "    Last name"
-            $cEmail = Read-Host "    Email"
-            # Azure Support wants the Windows time-zone NAME (Microsoft Time Zone Index Values),
-            # e.g. "Pacific Standard Time" / "Eastern Standard Time" / "UTC" -- NOT IANA (America/New_York).
-            $cTz    = ''
-            try { $cTz = Read-Host "    Time zone - Windows name, e.g. Eastern Standard Time [Pacific Standard Time]" -ErrorAction Stop } catch {}
-            if ([string]::IsNullOrWhiteSpace($cTz)) { $cTz = 'Pacific Standard Time' }
-            # An IANA value (contains '/') will be rejected by the create API -- fall back to a valid default.
-            if ($cTz -match '/') {
-                Write-Host ("    '{0}' looks like an IANA name; Azure needs the Windows name. Using 'Pacific Standard Time'." -f $cTz) -ForegroundColor Yellow
-                $cTz = 'Pacific Standard Time'
-            }
-
-            # Resolve support service + problem classification via the Azure Support REST API.
-            # Uses the same bearer token already acquired for the SQL capabilities check —
-            # no CLI extension required and no hardcoded GUIDs.
-            $supportBase = 'https://management.azure.com'
-            $supportVer  = '2020-04-01'
-            $restHeaders = @{ Authorization = "Bearer $token"; 'Content-Type' = 'application/json' }
-
-            Write-Host ''
-            Write-Host "  Resolving Azure support classification..." -ForegroundColor DarkGray
-            $svc = $null
-            $pc  = $null
-            try {
-                $svcsResp = Invoke-RestMethod -Method GET `
-                    -Uri "$supportBase/providers/Microsoft.Support/services?api-version=$supportVer" `
-                    -Headers $restHeaders -ErrorAction Stop
-                $svc = $svcsResp.value | Where-Object { $_.properties.displayName -match 'Service and subscription limits' } | Select-Object -First 1
-                if (-not $svc) {
-                    $svc = $svcsResp.value | Where-Object { $_.properties.displayName -match 'SQL Database' -and $_.properties.displayName -notmatch 'Managed Instance' } | Select-Object -First 1
-                }
-
-                if ($svc) {
-                    $pcsResp = Invoke-RestMethod -Method GET `
-                        -Uri "$supportBase/providers/Microsoft.Support/services/$($svc.name)/problemClassifications?api-version=$supportVer" `
-                        -Headers $restHeaders -ErrorAction Stop
-                    # \bSQL\b avoids matching "MySQL", "PostgreSQL", etc.
-                    $pc = $pcsResp.value | Where-Object { $_.properties.displayName -match '\bSQL\b' -and $_.properties.displayName -notmatch 'MySQL|PostgreSQL|MariaDB|Cosmos|Redis' } | Select-Object -First 1
-                    if (-not $pc) {
-                        $pc = $pcsResp.value | Where-Object { $_.properties.displayName -match 'quota|limit|provisioning|region' -and $_.properties.displayName -notmatch 'MySQL|PostgreSQL|MariaDB|Cosmos|Redis' } | Select-Object -First 1
-                    }
-                    if (-not $pc) { $pc = $pcsResp.value | Select-Object -First 1 }
-                }
-            }
-            catch {
-                Write-Warning ("  Could not resolve support classification: {0}" -f $_.Exception.Message)
-            }
-
-            if (-not $svc -or -not $pc) {
-                Write-Host ''
-                Write-Host "  Open tickets manually:" -ForegroundColor Yellow
-                Write-Host "  Portal > Help + Support > New Support Request" -ForegroundColor White
-                Write-Host "  Issue type : Service and subscription limits (quotas)" -ForegroundColor White
-                Write-Host "  Service    : SQL Database" -ForegroundColor White
-                Write-Host ("  Region(s)  : {0}" -f (($sqlTicketable | Select-Object -ExpandProperty DisplayName) -join ', ')) -ForegroundColor White
-                Write-Host ("  Sub ID     : {0}" -f $subId) -ForegroundColor White
-            }
-            else {
-                Write-Host ("  Classification : {0}" -f $pc.properties.displayName) -ForegroundColor DarkGray
-                Write-Host ''
-
-                foreach ($r in $sqlTicketable) {
-                    $tName  = "nmm-sql-$($r.Region)-$(Get-Date -Format 'yyyyMMddHHmm')"
-                    $tTitle = "SQL Standard S1 provisioning restricted: $($r.DisplayName)"
-                    $tBody  = @"
-Requesting lift of Azure SQL Standard S1 provisioning restriction for a Nerdio Manager for MSP (NMM) Azure Marketplace deployment.
-
-Subscription : $subId
-Region       : $($r.DisplayName) ($($r.Region))
-API message  : $($r.SqlReason)
-
-NMM requires an Azure SQL Database Standard S1 (20 DTU, non-Managed-Instance). The Microsoft.Sql/locations/capabilities API reports provisioning is restricted in $($r.DisplayName) for this subscription. Please lift the restriction or advise on expected availability.
-"@
-                    $ticketPayload = @{
-                        properties = @{
-                            serviceId               = $svc.id
-                            problemClassificationId = $pc.id
-                            title                   = $tTitle
-                            description             = $tBody
-                            severity                = 'minimal'
-                            advancedDiagnosticConsent = 'Yes'
-                            contactDetails          = @{
-                                firstName                = $cFirst
-                                lastName                 = $cLast
-                                primaryEmailAddress      = $cEmail
-                                preferredContactMethod   = 'email'
-                                preferredSupportLanguage = 'en-US'
-                                preferredTimeZone        = $cTz
-                                country                  = 'USA'
-                            }
-                        }
-                    } | ConvertTo-Json -Depth 10
-
-                    Write-Host ("  Filing ticket for {0}..." -f $r.DisplayName) -ForegroundColor DarkGray
-                    try {
-                        # Capture response headers to handle the 202 async operation pattern.
-                        $putUri = "$supportBase/subscriptions/$subId/providers/Microsoft.Support/supportTickets/$($tName)?api-version=$supportVer"
-                        $putHeaders = $null
-                        $null = Invoke-RestMethod -Method PUT -Uri $putUri -Headers $restHeaders `
-                            -Body $ticketPayload -ResponseHeadersVariable 'putHeaders' -ErrorAction Stop
-
-                        # Resolve async operation URL (Azure-AsyncOperation takes precedence over Location).
-                        $asyncUrl = $null
-                        if ($putHeaders) {
-                            if ($putHeaders['Azure-AsyncOperation']) { $asyncUrl = [string]$putHeaders['Azure-AsyncOperation'] }
-                            elseif ($putHeaders['Location'])          { $asyncUrl = [string]$putHeaders['Location'] }
-                        }
-
-                        if ($asyncUrl) {
-                            Write-Host "       Waiting for ticket to be provisioned..." -ForegroundColor DarkGray
-                            $opStatus = ''; $tries = 0; $op = $null
-                            do {
-                                Start-Sleep -Seconds 5; $tries++
-                                $op = Invoke-RestMethod -Method GET -Uri $asyncUrl -Headers $restHeaders -ErrorAction SilentlyContinue
-                                $opStatus = if ($op -and $op.status) { $op.status } else { '' }
-                            } while ($opStatus -match '^(InProgress|Accepted|Running)$' -and $tries -lt 12)
-
-                            if ($opStatus -ne 'Succeeded') {
-                                $opReason = if ($op -and $op.error -and $op.error.message) { $op.error.message }
-                                            else { "async operation ended with status: '$opStatus'" }
-                                throw [Exception]::new($opReason)
-                            }
-                        }
-
-                        # GET the ticket to confirm it exists and retrieve its current status.
-                        $ticket = $null
-                        try {
-                            $ticket = Invoke-RestMethod -Method GET -Uri $putUri -Headers $restHeaders -ErrorAction Stop
-                        }
-                        catch {
-                            # 404 here means the async op claimed Succeeded but the ticket was never created.
-                            # The most common cause is no paid Azure support plan on the subscription.
-                            $getErrMsg = ($_.ErrorDetails.Message | ConvertFrom-Json -ErrorAction SilentlyContinue).error.message
-                            if ($getErrMsg -match 'does not exist' -or $_.Exception.Message -match '404|Not Found') {
-                                throw [Exception]::new(
-                                    "Ticket was not created. This subscription may not have a paid Azure support plan. " +
-                                    "Ticket creation via API requires Developer tier or higher. " +
-                                    "Use the portal fallback link below to open the ticket manually."
-                                )
-                            }
-                            throw
-                        }
-                        Write-Host ("  [OK] {0}  (status: {1})" -f $ticket.name, $ticket.properties.status) -ForegroundColor Green
-                        if ($ticket.properties.supportPlanDisplayName) {
-                            Write-Host ("       Plan   : {0}" -f $ticket.properties.supportPlanDisplayName) -ForegroundColor DarkGray
-                        }
-                        Write-Host ("       Portal : https://portal.azure.com/#resource/subscriptions/$subId/providers/Microsoft.Support/supportTickets/$($ticket.name)") -ForegroundColor Cyan
-                    }
-                    catch {
-                        $errMsg   = $_.ErrorDetails.Message | ConvertFrom-Json -ErrorAction SilentlyContinue
-                        $reason   = if ($errMsg.error.message) { $errMsg.error.message } else { $_.Exception.Message }
-                        Write-Warning ("  Ticket creation failed: {0}" -f $reason)
-                        Write-Host   "  Fallback: Portal > Help + Support > New Support Request" -ForegroundColor Yellow
-                    }
-                }
-
-                Write-Host ''
-                Write-Host "  All support requests: https://portal.azure.com/#view/Microsoft_Azure_Support/HelpAndSupportBlade/~/manageSupportRequest" -ForegroundColor Cyan
-            }
-        }
-    }
 }
