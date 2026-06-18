@@ -1,18 +1,32 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 <#
 .SYNOPSIS
-    Nerdio Manager for MSP (NMM) pre-install region eligibility checker.
+    Nerdio Manager for MSP (NMM) pre-install readiness checker.
 
 .DESCRIPTION
-    Surfaces the Azure regions that offer BOTH resources the NMM Azure Marketplace
-    deployment needs, so an SE can tell a partner on a live call which regions are
-    safe to pick in the deployment wizard:
+    Three-phase pre-install check to catch the most common NMM deployment blockers
+    before the partner starts the Azure Marketplace wizard:
 
-        1. App Service Plan  : Basic Medium (B2), Windows  <- "Basic VM SKU app service quota" pain point
-        2. Azure SQL Database: Standard tier / S1 (DTU)     <- "can't deploy managed SQL" pain point
+        Phase 0 - Permission check
+            Verifies the signed-in account holds Subscription Owner AND Entra ID
+            Global Administrator. Missing either will cause the install to fail.
 
-    The script cross-references the two and prints a clean table plus a plain-English
-    "these are the regions you could select" summary line. Optionally writes a CSV.
+        Phase 1 - Resource provider registration
+            Reports the registration state of the 14 providers NMM requires.
+            Pass -RegisterProviders to kick off registration automatically and
+            poll until all reach "Registered".
+
+        Phase 2 - Region eligibility
+            Surfaces the Azure regions that offer BOTH resources the NMM Azure
+            Marketplace deployment needs, so an SE can tell a partner on a live call
+            which regions are safe to pick in the deployment wizard:
+
+                1. App Service Plan  : Basic Medium (B2), Windows  <- "Basic VM SKU app service quota" pain point
+                2. Azure SQL Database: Standard tier / S1 (DTU)     <- "can't deploy managed SQL" pain point
+
+            The script cross-references the two and prints a clean table plus a
+            plain-English "these are the regions you could select" summary line,
+            and explains why each excluded region was rejected. Optionally writes a CSV.
 
     AVAILABILITY vs. QUOTA -- READ THIS:
     This tool reports whether each SKU is AVAILABLE / OFFERED to the subscription in a
@@ -52,9 +66,30 @@
 .PARAMETER OutFile
     Optional path to write a CSV of the full result table.
 
+.PARAMETER RegisterProviders
+    When set, Phase 1 automatically registers any unregistered required providers and
+    polls until they all reach "Registered" (or ProviderTimeoutMinutes is hit). Without
+    this switch Phase 1 reports provider state but makes no changes.
+
+.PARAMETER ProviderTimeoutMinutes
+    How long Phase 1 waits for provider registration to complete. Default 15.
+
+.PARAMETER OpenTicket
+    When set, Phase 3 prompts to file Azure support tickets for the SQL regions where the
+    capabilities API returns a provisioning restriction ("open a support request"). Requires
+    a paid Azure support plan (Developer, Standard, or higher) on the subscription.
+
 .EXAMPLE
     ./Check-NMMRegionEligibility.ps1
-    Prompt for the partner's geography, then check those regions for B2 + Standard/S1.
+    Run all phases; prompt for the partner's geography for the Phase 2 region check.
+
+.EXAMPLE
+    ./Check-NMMRegionEligibility.ps1 -OpenTicket
+    Also offer to file Azure support tickets (Phase 3) for SQL provisioning-restricted regions.
+
+.EXAMPLE
+    ./Check-NMMRegionEligibility.ps1 -RegisterProviders
+    Also register any missing providers automatically during Phase 1.
 
 .EXAMPLE
     ./Check-NMMRegionEligibility.ps1 -Geography US
@@ -83,6 +118,8 @@ param(
     [string]$Geography,
     [string]$SubscriptionId,
     [string]$OutFile,
+    [switch]$RegisterProviders,
+    [int]$ProviderTimeoutMinutes = 15,
 
     # When set, prompts to file Azure support tickets for SQL regions where the
     # capabilities API returns a provisioning restriction ("open a support request").
@@ -94,6 +131,23 @@ param(
 # under 'Stop' PowerShell 5.1 promotes native stderr to a terminating error. Error handling
 # here is explicit (throw / try-catch), which terminates regardless of this preference.
 $ErrorActionPreference = 'Continue'
+
+$NmmRequiredProviders = @(
+    'Microsoft.KeyVault',
+    'Microsoft.Compute',
+    'Microsoft.Automation',
+    'Microsoft.Storage',
+    'Microsoft.Insights',
+    'Microsoft.OperationalInsights',
+    'Microsoft.DesktopVirtualization',
+    'Microsoft.Network',
+    'Microsoft.AAD',
+    'Microsoft.RecoveryServices',
+    'Microsoft.Web',
+    'Microsoft.Quota',
+    'Microsoft.Solutions',
+    'Microsoft.Sql'
+)
 
 function Write-Banner {
     param([string]$Text)
@@ -168,11 +222,132 @@ if (-not $token) {
     throw "Could not acquire an Azure access token ('az account get-access-token' failed)."
 }
 
-Write-Banner "Nerdio Manager for MSP (NMM) - Region Eligibility Check"
+Write-Banner "Nerdio Manager for MSP (NMM) - Pre-Install Readiness Check"
 Write-Host ("Subscription : {0}" -f $ctx.name)
 Write-Host ("Sub ID       : {0}" -f $ctx.id)
 Write-Host ("Checking for : App Service '{0}'  +  Azure SQL '{1}/{2}'" -f $AppServiceSku, $SqlEdition, $SqlServiceObjective)
 Write-Host ''
+
+# --- Phase 0: Permission check (Owner + Global Administrator) ---------------
+Write-Banner "Phase 0: Permission Check"
+
+$me = az ad signed-in-user show --only-show-errors 2>$null | ConvertFrom-Json
+if (-not $me) {
+    Write-Warning "Could not retrieve signed-in user info -- permission check skipped. Ensure 'az login' is complete."
+} else {
+    Write-Host ("Signed-in user : {0}  ({1})" -f $me.displayName, $me.userPrincipalName)
+    Write-Host ''
+
+    # Owner on the subscription -- direct, group-inherited, and parent-scope (management group) assignments
+    $ownerAssignments = az role assignment list `
+        --assignee $me.id `
+        --role Owner `
+        --scope "/subscriptions/$($ctx.id)" `
+        --include-groups `
+        --include-inherited `
+        --only-show-errors 2>$null | ConvertFrom-Json
+    $isOwner = ($null -ne $ownerAssignments -and @($ownerAssignments).Count -gt 0)
+
+    # Global Administrator in Entra ID via Microsoft Graph.
+    # Role template ID 62e90394-... is the well-known GUID for Global Administrator across all tenants.
+    $isGA   = $null   # $null = check indeterminate; $true/$false = definitive
+    $gaNote = ''
+    try {
+        $GA_TEMPLATE_ID = '62e90394-69f5-4237-9190-012177145e10'
+        $dirRoles = az rest --method GET `
+            --url 'https://graph.microsoft.com/v1.0/me/transitiveMemberOf/microsoft.graph.directoryRole' `
+            --only-show-errors 2>$null | ConvertFrom-Json
+        if ($dirRoles -and $dirRoles.PSObject.Properties['value']) {
+            $isGA = [bool]($dirRoles.value | Where-Object { $_.roleTemplateId -eq $GA_TEMPLATE_ID })
+        } else {
+            $gaNote = ' (no directory roles returned)'
+        }
+    } catch {
+        $gaNote = ' (Graph API check failed -- verify manually)'
+    }
+
+    $ownerLabel = if ($isOwner) { 'PASS' } else { 'FAIL' }
+    $gaLabel    = if ($null -eq $isGA) { "UNKNOWN$gaNote" } elseif ($isGA) { 'PASS' } else { 'FAIL' }
+    $ownerColor = if ($isOwner) { 'Green' } else { 'Red' }
+    $gaColor    = if ($null -eq $isGA) { 'Yellow' } elseif ($isGA) { 'Green' } else { 'Red' }
+
+    "{0,-55} {1}" -f "  Subscription Owner", $ownerLabel | Write-Host -ForegroundColor $ownerColor
+    "{0,-55} {1}" -f "  Entra ID Global Administrator", $gaLabel | Write-Host -ForegroundColor $gaColor
+    Write-Host ''
+
+    $permFail = (-not $isOwner) -or ($isGA -eq $false)
+    if ($permFail) {
+        Write-Host '  ACTION REQUIRED: Missing permissions will cause the NMM install to fail.' -ForegroundColor Red
+        if (-not $isOwner) {
+            Write-Host ("  -> Assign Owner on subscription '{0}' before registering providers or installing NMM." -f $ctx.name) -ForegroundColor Red
+        }
+        if ($isGA -eq $false) {
+            Write-Host '  -> Assign Global Administrator in Entra ID before running the NMM install.' -ForegroundColor Red
+        }
+        Write-Host '  (Continuing with remaining checks for informational purposes...)' -ForegroundColor DarkGray
+    } else {
+        Write-Host '  All required permissions confirmed.' -ForegroundColor Green
+    }
+}
+Write-Host ''
+
+# --- Phase 1: Resource provider registration --------------------------------
+Write-Banner "Phase 1: Resource Provider Registration"
+Write-Host ("Checking {0} required providers..." -f $NmmRequiredProviders.Count) -ForegroundColor DarkGray
+Write-Host ''
+
+$providerResults = [System.Collections.Generic.List[object]]::new()
+foreach ($ns in $NmmRequiredProviders) {
+    $state = az provider show --namespace $ns --query registrationState --output tsv --only-show-errors 2>$null
+    if (-not $state) { $state = 'UNKNOWN' }
+    $providerResults.Add([pscustomobject]@{ Provider = $ns; State = $state })
+}
+$providerResults | Format-Table -AutoSize | Out-Host
+
+$unregistered = @($providerResults | Where-Object { $_.State -ne 'Registered' })
+
+if ($unregistered.Count -eq 0) {
+    Write-Host 'All required providers are Registered.' -ForegroundColor Green
+} elseif ($RegisterProviders) {
+    Write-Host ("Registering {0} provider(s)..." -f $unregistered.Count) -ForegroundColor Yellow
+    foreach ($p in $unregistered) {
+        Write-Host ("  {0}: {1} -> registering..." -f $p.Provider, $p.State) -ForegroundColor Yellow
+        az provider register --namespace $p.Provider --output none --only-show-errors
+    }
+
+    Write-Host ''
+    Write-Host ("Polling until all providers reach 'Registered' (timeout: {0}m)..." -f $ProviderTimeoutMinutes)
+    $deadline = (Get-Date).AddMinutes($ProviderTimeoutMinutes)
+    do {
+        Start-Sleep -Seconds 15
+        $pending = [System.Collections.Generic.List[string]]::new()
+        foreach ($ns in $NmmRequiredProviders) {
+            $state = az provider show --namespace $ns --query registrationState --output tsv --only-show-errors 2>$null
+            if ($state -and $state -ne 'Registered') { $pending.Add("$ns ($state)") }
+        }
+        if ($pending.Count -gt 0) {
+            Write-Host ("  Still pending: {0}" -f ($pending -join ', '))
+        }
+    } while ($pending.Count -gt 0 -and (Get-Date) -lt $deadline)
+
+    if ($pending.Count -gt 0) {
+        Write-Warning ("Some providers did not finish within {0} minutes. Re-run before attempting the NMM install." -f $ProviderTimeoutMinutes)
+    } else {
+        Write-Host 'All providers are now Registered.' -ForegroundColor Green
+    }
+} else {
+    Write-Host ("{0} provider(s) are not registered:" -f $unregistered.Count) -ForegroundColor Yellow
+    foreach ($p in $unregistered) {
+        Write-Host ("  - {0}  ({1})" -f $p.Provider, $p.State) -ForegroundColor Yellow
+    }
+    Write-Host ''
+    Write-Host 'Re-run with -RegisterProviders to register them automatically.' -ForegroundColor Yellow
+    Write-Host '(Continuing with region check...)' -ForegroundColor DarkGray
+}
+Write-Host ''
+
+# --- Phase 2: Region eligibility --------------------------------------------
+Write-Banner "Phase 2: Region Eligibility"
 
 # --- 1. Authoritative region map (displayName -> slug) ----------------------
 Write-Host "Loading Azure region list..." -ForegroundColor DarkGray
@@ -355,7 +530,7 @@ $sorted   = $results | Sort-Object @{E={$_.Eligible -eq 'YES'};Descending=$true}
 $eligible = @($sorted | Where-Object { $_.Eligible -eq 'YES' })
 
 Write-Banner "Results"
-$sorted | Format-Table Region, DisplayName, AppService, SqlDb, Eligible -AutoSize
+$sorted | Format-Table Region, DisplayName, AppService, SqlDb, Eligible -AutoSize | Out-Host
 
 Write-Banner "RECOMMENDATION"
 if ($eligible.Count -gt 0) {
@@ -436,9 +611,16 @@ else {
             $cFirst = Read-Host "    First name"
             $cLast  = Read-Host "    Last name"
             $cEmail = Read-Host "    Email"
+            # Azure Support wants the Windows time-zone NAME (Microsoft Time Zone Index Values),
+            # e.g. "Pacific Standard Time" / "Eastern Standard Time" / "UTC" -- NOT IANA (America/New_York).
             $cTz    = ''
-            try { $cTz = Read-Host "    Time zone [Pacific Standard Time]" -ErrorAction Stop } catch {}
+            try { $cTz = Read-Host "    Time zone - Windows name, e.g. Eastern Standard Time [Pacific Standard Time]" -ErrorAction Stop } catch {}
             if ([string]::IsNullOrWhiteSpace($cTz)) { $cTz = 'Pacific Standard Time' }
+            # An IANA value (contains '/') will be rejected by the create API -- fall back to a valid default.
+            if ($cTz -match '/') {
+                Write-Host ("    '{0}' looks like an IANA name; Azure needs the Windows name. Using 'Pacific Standard Time'." -f $cTz) -ForegroundColor Yellow
+                $cTz = 'Pacific Standard Time'
+            }
 
             # Resolve support service + problem classification via the Azure Support REST API.
             # Uses the same bearer token already acquired for the SQL capabilities check —
