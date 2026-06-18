@@ -479,7 +479,11 @@ else {
                 $pc   = $null
                 if ($svc) {
                     $pcs = az support services problem-classifications list --service-name $svc.name -o json 2>$null | ConvertFrom-Json
-                    $pc  = $pcs | Where-Object { $_.displayName -match 'SQL|quota|limit|provisioning|region' } | Select-Object -First 1
+                    # Word-boundary \bSQL\b avoids matching "MySQL", "PostgreSQL", etc.
+                    $pc  = $pcs | Where-Object { $_.displayName -match '\bSQL\b' -and $_.displayName -notmatch 'MySQL|PostgreSQL|MariaDB|Cosmos|Redis' } | Select-Object -First 1
+                    if (-not $pc) {
+                        $pc = $pcs | Where-Object { $_.displayName -match 'quota|limit|provisioning|region' -and $_.displayName -notmatch 'MySQL|PostgreSQL|MariaDB|Cosmos|Redis' } | Select-Object -First 1
+                    }
                     if (-not $pc) { $pc = $pcs | Select-Object -First 1 }
                     $pcId = if ($pc) { $pc.id } else { $null }
                 }
@@ -519,7 +523,7 @@ NMM requires an Azure SQL Database Standard S1 (20 DTU, non-Managed-Instance). T
                             --contact-preferred-contact-method    "email" `
                             --contact-preferred-support-language  "en-US" `
                             --contact-preferred-time-zone         $cTz `
-                            --only-show-errors -o json 2>$null | ConvertFrom-Json
+                            --only-show-errors -o json | ConvertFrom-Json
 
                         if ($t -and $t.name) {
                             Write-Host ("  [OK] {0}  (status: {1})" -f $t.name, $t.status) -ForegroundColor Green
