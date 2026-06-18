@@ -527,9 +527,23 @@ NMM requires an Azure SQL Database Standard S1 (20 DTU, non-Managed-Instance). T
                             -Uri "$supportBase/subscriptions/$subId/providers/Microsoft.Support/supportTickets/$($tName)?api-version=$supportVer" `
                             -Headers $restHeaders -Body $ticketPayload -ErrorAction Stop
 
-                        Write-Host ("  [OK] {0}  (status: {1})" -f $t.name, $t.properties.status) -ForegroundColor Green
-                        if ($t.properties.supportPlanDisplayName) {
-                            Write-Host ("       Plan : {0}" -f $t.properties.supportPlanDisplayName) -ForegroundColor DarkGray
+                        # Ticket creation is async — verify it is retrievable before reporting success.
+                        Start-Sleep -Seconds 4
+                        $ticketUri = "$supportBase/subscriptions/$subId/providers/Microsoft.Support/supportTickets/$($tName)?api-version=$supportVer"
+                        $verify    = Invoke-RestMethod -Method GET -Uri $ticketUri -Headers $restHeaders -ErrorAction SilentlyContinue
+
+                        $finalName   = if ($verify.name)                           { $verify.name }                           else { $t.name }
+                        $finalStatus = if ($verify.properties.status)              { $verify.properties.status }              else { $t.properties.status }
+                        $finalPlan   = if ($verify.properties.supportPlanDisplayName) { $verify.properties.supportPlanDisplayName } else { $t.properties.supportPlanDisplayName }
+
+                        if ($finalName) {
+                            Write-Host ("  [OK] {0}  (status: {1})" -f $finalName, $finalStatus) -ForegroundColor Green
+                            if ($finalPlan) { Write-Host ("       Plan   : {0}" -f $finalPlan) -ForegroundColor DarkGray }
+                            Write-Host ("       Portal : https://portal.azure.com/#resource/subscriptions/$subId/providers/Microsoft.Support/supportTickets/$finalName") -ForegroundColor Cyan
+                        }
+                        else {
+                            Write-Warning "  PUT returned OK but ticket could not be verified — it may still appear in the portal shortly."
+                            Write-Host   ("  Check: https://portal.azure.com/#view/Microsoft_Azure_Support/HelpAndSupportBlade/~/manageSupportRequest") -ForegroundColor Yellow
                         }
                     }
                     catch {
@@ -541,7 +555,7 @@ NMM requires an Azure SQL Database Standard S1 (20 DTU, non-Managed-Instance). T
                 }
 
                 Write-Host ''
-                Write-Host "  Track tickets: https://portal.azure.com/#blade/Microsoft_Azure_Support/HelpAndSupportBlade/manageSupportRequest" -ForegroundColor Cyan
+                Write-Host "  All support requests: https://portal.azure.com/#view/Microsoft_Azure_Support/HelpAndSupportBlade/~/manageSupportRequest" -ForegroundColor Cyan
             }
         }
     }
