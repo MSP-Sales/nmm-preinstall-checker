@@ -523,30 +523,36 @@ NMM requires an Azure SQL Database Standard S1 (20 DTU, non-Managed-Instance). T
 
                     Write-Host ("  Filing ticket for {0}..." -f $r.DisplayName) -ForegroundColor DarkGray
                     try {
-                        $t = Invoke-RestMethod -Method PUT `
-                            -Uri "$supportBase/subscriptions/$subId/providers/Microsoft.Support/supportTickets/$($tName)?api-version=$supportVer" `
-                            -Headers $restHeaders -Body $ticketPayload -ErrorAction Stop
+                        # Capture response headers to handle the 202 async operation pattern.
+                        $putUri = "$supportBase/subscriptions/$subId/providers/Microsoft.Support/supportTickets/$($tName)?api-version=$supportVer"
+                        $putHeaders = $null
+                        $null = Invoke-RestMethod -Method PUT -Uri $putUri -Headers $restHeaders `
+                            -Body $ticketPayload -ResponseHeadersVariable 'putHeaders' -ErrorAction Stop
 
-                        # PUT succeeded — report immediately; do not let a slow GET mask this.
-                        Write-Host ("  [OK] {0}  (status: {1})" -f $t.name, $t.properties.status) -ForegroundColor Green
-                        if ($t.properties.supportPlanDisplayName) {
-                            Write-Host ("       Plan   : {0}" -f $t.properties.supportPlanDisplayName) -ForegroundColor DarkGray
+                        # Resolve async operation URL (Azure-AsyncOperation takes precedence over Location).
+                        $asyncUrl = $null
+                        if ($putHeaders) {
+                            if ($putHeaders['Azure-AsyncOperation']) { $asyncUrl = [string]$putHeaders['Azure-AsyncOperation'] }
+                            elseif ($putHeaders['Location'])          { $asyncUrl = [string]$putHeaders['Location'] }
                         }
-                        Write-Host ("       Portal : https://portal.azure.com/#resource/subscriptions/$subId/providers/Microsoft.Support/supportTickets/$($t.name)") -ForegroundColor Cyan
 
-                        # Best-effort verification — ticket propagation can exceed 4s; failure here is not a problem.
-                        Start-Sleep -Seconds 5
-                        try {
-                            $verify = Invoke-RestMethod -Method GET `
-                                -Uri "$supportBase/subscriptions/$subId/providers/Microsoft.Support/supportTickets/$($t.name)?api-version=$supportVer" `
-                                -Headers $restHeaders -ErrorAction Stop
-                            if ($verify.properties.status -and $verify.properties.status -ne $t.properties.status) {
-                                Write-Host ("       Verified status: {0}" -f $verify.properties.status) -ForegroundColor DarkGray
-                            }
+                        if ($asyncUrl) {
+                            Write-Host "       Waiting for ticket to be provisioned..." -ForegroundColor DarkGray
+                            $opStatus = ''; $tries = 0
+                            do {
+                                Start-Sleep -Seconds 5; $tries++
+                                $op = Invoke-RestMethod -Method GET -Uri $asyncUrl -Headers $restHeaders -ErrorAction SilentlyContinue
+                                $opStatus = if ($op.status) { $op.status } else { '' }
+                            } while ($opStatus -match '^(InProgress|Accepted|Running)$' -and $tries -lt 12)
                         }
-                        catch {
-                            Write-Host "       (Portal link may take a few minutes to activate)" -ForegroundColor DarkGray
+
+                        # GET the ticket to confirm it exists and retrieve its current status.
+                        $ticket = Invoke-RestMethod -Method GET -Uri $putUri -Headers $restHeaders -ErrorAction Stop
+                        Write-Host ("  [OK] {0}  (status: {1})" -f $ticket.name, $ticket.properties.status) -ForegroundColor Green
+                        if ($ticket.properties.supportPlanDisplayName) {
+                            Write-Host ("       Plan   : {0}" -f $ticket.properties.supportPlanDisplayName) -ForegroundColor DarkGray
                         }
+                        Write-Host ("       Portal : https://portal.azure.com/#resource/subscriptions/$subId/providers/Microsoft.Support/supportTickets/$($ticket.name)") -ForegroundColor Cyan
                     }
                     catch {
                         $errMsg   = $_.ErrorDetails.Message | ConvertFrom-Json -ErrorAction SilentlyContinue
