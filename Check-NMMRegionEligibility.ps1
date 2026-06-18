@@ -538,12 +538,18 @@ NMM requires an Azure SQL Database Standard S1 (20 DTU, non-Managed-Instance). T
 
                         if ($asyncUrl) {
                             Write-Host "       Waiting for ticket to be provisioned..." -ForegroundColor DarkGray
-                            $opStatus = ''; $tries = 0
+                            $opStatus = ''; $tries = 0; $op = $null
                             do {
                                 Start-Sleep -Seconds 5; $tries++
                                 $op = Invoke-RestMethod -Method GET -Uri $asyncUrl -Headers $restHeaders -ErrorAction SilentlyContinue
-                                $opStatus = if ($op.status) { $op.status } else { '' }
+                                $opStatus = if ($op -and $op.status) { $op.status } else { '' }
                             } while ($opStatus -match '^(InProgress|Accepted|Running)$' -and $tries -lt 12)
+
+                            if ($opStatus -ne 'Succeeded') {
+                                $opReason = if ($op -and $op.error -and $op.error.message) { $op.error.message }
+                                            else { "async operation ended with status: '$opStatus'" }
+                                throw [Exception]::new($opReason)
+                            }
                         }
 
                         # GET the ticket to confirm it exists and retrieve its current status.
