@@ -1,32 +1,18 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    Nerdio Manager for MSP (NMM) pre-install readiness checker.
+    Nerdio Manager for MSP (NMM) pre-install region eligibility checker.
 
 .DESCRIPTION
-    Three-phase pre-install check to catch the most common NMM deployment blockers
-    before the partner starts the Azure Marketplace wizard:
+    Surfaces the Azure regions that offer BOTH resources the NMM Azure Marketplace
+    deployment needs, so an SE can tell a partner on a live call which regions are
+    safe to pick in the deployment wizard:
 
-        Phase 0 - Permission check
-            Verifies the signed-in account holds Subscription Owner AND Entra ID
-            Global Administrator. Missing either will cause the install to fail.
+        1. App Service Plan  : Basic Medium (B2), Windows  <- "Basic VM SKU app service quota" pain point
+        2. Azure SQL Database: Standard tier / S1 (DTU)     <- "can't deploy managed SQL" pain point
 
-        Phase 1 - Resource provider registration
-            Reports the registration state of the 14 providers NMM requires.
-            Pass -RegisterProviders to kick off registration automatically and
-            poll until all reach "Registered".
-
-        Phase 2 - Region eligibility
-            Surfaces the Azure regions that offer BOTH resources the NMM Azure
-            Marketplace deployment needs, so an SE can tell a partner on a live call
-            which regions are safe to pick in the deployment wizard:
-
-                1. App Service Plan  : Basic Medium (B2), Windows  <- "Basic VM SKU app service quota" pain point
-                2. Azure SQL Database: Standard tier / S1 (DTU)     <- "can't deploy managed SQL" pain point
-
-            The script cross-references the two and prints a clean table plus a
-            plain-English "these are the regions you could select" summary line,
-            and explains why each excluded region was rejected. Optionally writes a CSV.
+    The script cross-references the two and prints a clean table plus a plain-English
+    "these are the regions you could select" summary line. Optionally writes a CSV.
 
     AVAILABILITY vs. QUOTA -- READ THIS:
     This tool reports whether each SKU is AVAILABLE / OFFERED to the subscription in a
@@ -66,21 +52,9 @@
 .PARAMETER OutFile
     Optional path to write a CSV of the full result table.
 
-.PARAMETER RegisterProviders
-    When set, Phase 1 automatically registers any unregistered required providers and
-    polls until they all reach "Registered" (or ProviderTimeoutMinutes is hit). Without
-    this switch Phase 1 reports provider state but makes no changes.
-
-.PARAMETER ProviderTimeoutMinutes
-    How long Phase 1 waits for provider registration to complete. Default 15.
-
 .EXAMPLE
     ./Check-NMMRegionEligibility.ps1
-    Run all three phases; prompt for the partner's geography for the Phase 2 region check.
-
-.EXAMPLE
-    ./Check-NMMRegionEligibility.ps1 -RegisterProviders
-    Also register any missing providers automatically during Phase 1.
+    Prompt for the partner's geography, then check those regions for B2 + Standard/S1.
 
 .EXAMPLE
     ./Check-NMMRegionEligibility.ps1 -Geography US
@@ -109,31 +83,17 @@ param(
     [string]$Geography,
     [string]$SubscriptionId,
     [string]$OutFile,
-    [switch]$RegisterProviders,
-    [int]$ProviderTimeoutMinutes = 15
+
+    # When set, prompts to file Azure support tickets for SQL regions where the
+    # capabilities API returns a provisioning restriction ("open a support request").
+    # Requires a paid Azure support plan (Developer, Standard, or higher).
+    [switch]$OpenTicket
 )
 
 # NOTE: deliberately NOT 'Stop'. The Azure CLI writes harmless warnings to stderr, and
 # under 'Stop' PowerShell 5.1 promotes native stderr to a terminating error. Error handling
 # here is explicit (throw / try-catch), which terminates regardless of this preference.
 $ErrorActionPreference = 'Continue'
-
-$NmmRequiredProviders = @(
-    'Microsoft.KeyVault',
-    'Microsoft.Compute',
-    'Microsoft.Automation',
-    'Microsoft.Storage',
-    'Microsoft.Insights',
-    'Microsoft.OperationalInsights',
-    'Microsoft.DesktopVirtualization',
-    'Microsoft.Network',
-    'Microsoft.AAD',
-    'Microsoft.RecoveryServices',
-    'Microsoft.Web',
-    'Microsoft.Quota',
-    'Microsoft.Solutions',
-    'Microsoft.Sql'
-)
 
 function Write-Banner {
     param([string]$Text)
@@ -208,132 +168,11 @@ if (-not $token) {
     throw "Could not acquire an Azure access token ('az account get-access-token' failed)."
 }
 
-Write-Banner "Nerdio Manager for MSP (NMM) - Pre-Install Readiness Check"
+Write-Banner "Nerdio Manager for MSP (NMM) - Region Eligibility Check"
 Write-Host ("Subscription : {0}" -f $ctx.name)
 Write-Host ("Sub ID       : {0}" -f $ctx.id)
 Write-Host ("Checking for : App Service '{0}'  +  Azure SQL '{1}/{2}'" -f $AppServiceSku, $SqlEdition, $SqlServiceObjective)
 Write-Host ''
-
-# --- Phase 0: Permission check (Owner + Global Administrator) ---------------
-Write-Banner "Phase 0: Permission Check"
-
-$me = az ad signed-in-user show --only-show-errors 2>$null | ConvertFrom-Json
-if (-not $me) {
-    Write-Warning "Could not retrieve signed-in user info -- permission check skipped. Ensure 'az login' is complete."
-} else {
-    Write-Host ("Signed-in user : {0}  ({1})" -f $me.displayName, $me.userPrincipalName)
-    Write-Host ''
-
-    # Owner on the subscription -- direct, group-inherited, and parent-scope (management group) assignments
-    $ownerAssignments = az role assignment list `
-        --assignee $me.id `
-        --role Owner `
-        --scope "/subscriptions/$($ctx.id)" `
-        --include-groups `
-        --include-inherited `
-        --only-show-errors 2>$null | ConvertFrom-Json
-    $isOwner = ($null -ne $ownerAssignments -and @($ownerAssignments).Count -gt 0)
-
-    # Global Administrator in Entra ID via Microsoft Graph.
-    # Role template ID 62e90394-... is the well-known GUID for Global Administrator across all tenants.
-    $isGA   = $null   # $null = check indeterminate; $true/$false = definitive
-    $gaNote = ''
-    try {
-        $GA_TEMPLATE_ID = '62e90394-69f5-4237-9190-012177145e10'
-        $dirRoles = az rest --method GET `
-            --url 'https://graph.microsoft.com/v1.0/me/transitiveMemberOf/microsoft.graph.directoryRole' `
-            --only-show-errors 2>$null | ConvertFrom-Json
-        if ($dirRoles -and $dirRoles.PSObject.Properties['value']) {
-            $isGA = [bool]($dirRoles.value | Where-Object { $_.roleTemplateId -eq $GA_TEMPLATE_ID })
-        } else {
-            $gaNote = ' (no directory roles returned)'
-        }
-    } catch {
-        $gaNote = ' (Graph API check failed -- verify manually)'
-    }
-
-    $ownerLabel = if ($isOwner) { 'PASS' } else { 'FAIL' }
-    $gaLabel    = if ($null -eq $isGA) { "UNKNOWN$gaNote" } elseif ($isGA) { 'PASS' } else { 'FAIL' }
-    $ownerColor = if ($isOwner) { 'Green' } else { 'Red' }
-    $gaColor    = if ($null -eq $isGA) { 'Yellow' } elseif ($isGA) { 'Green' } else { 'Red' }
-
-    "{0,-55} {1}" -f "  Subscription Owner", $ownerLabel | Write-Host -ForegroundColor $ownerColor
-    "{0,-55} {1}" -f "  Entra ID Global Administrator", $gaLabel | Write-Host -ForegroundColor $gaColor
-    Write-Host ''
-
-    $permFail = (-not $isOwner) -or ($isGA -eq $false)
-    if ($permFail) {
-        Write-Host '  ACTION REQUIRED: Missing permissions will cause the NMM install to fail.' -ForegroundColor Red
-        if (-not $isOwner) {
-            Write-Host ("  -> Assign Owner on subscription '{0}' before registering providers or installing NMM." -f $ctx.name) -ForegroundColor Red
-        }
-        if ($isGA -eq $false) {
-            Write-Host '  -> Assign Global Administrator in Entra ID before running the NMM install.' -ForegroundColor Red
-        }
-        Write-Host '  (Continuing with remaining checks for informational purposes...)' -ForegroundColor DarkGray
-    } else {
-        Write-Host '  All required permissions confirmed.' -ForegroundColor Green
-    }
-}
-Write-Host ''
-
-# --- Phase 1: Resource provider registration --------------------------------
-Write-Banner "Phase 1: Resource Provider Registration"
-Write-Host ("Checking {0} required providers..." -f $NmmRequiredProviders.Count) -ForegroundColor DarkGray
-Write-Host ''
-
-$providerResults = [System.Collections.Generic.List[object]]::new()
-foreach ($ns in $NmmRequiredProviders) {
-    $state = az provider show --namespace $ns --query registrationState --output tsv --only-show-errors 2>$null
-    if (-not $state) { $state = 'UNKNOWN' }
-    $providerResults.Add([pscustomobject]@{ Provider = $ns; State = $state })
-}
-$providerResults | Format-Table -AutoSize | Out-Host
-
-$unregistered = @($providerResults | Where-Object { $_.State -ne 'Registered' })
-
-if ($unregistered.Count -eq 0) {
-    Write-Host 'All required providers are Registered.' -ForegroundColor Green
-} elseif ($RegisterProviders) {
-    Write-Host ("Registering {0} provider(s)..." -f $unregistered.Count) -ForegroundColor Yellow
-    foreach ($p in $unregistered) {
-        Write-Host ("  {0}: {1} -> registering..." -f $p.Provider, $p.State) -ForegroundColor Yellow
-        az provider register --namespace $p.Provider --output none --only-show-errors
-    }
-
-    Write-Host ''
-    Write-Host ("Polling until all providers reach 'Registered' (timeout: {0}m)..." -f $ProviderTimeoutMinutes)
-    $deadline = (Get-Date).AddMinutes($ProviderTimeoutMinutes)
-    do {
-        Start-Sleep -Seconds 15
-        $pending = [System.Collections.Generic.List[string]]::new()
-        foreach ($ns in $NmmRequiredProviders) {
-            $state = az provider show --namespace $ns --query registrationState --output tsv --only-show-errors 2>$null
-            if ($state -and $state -ne 'Registered') { $pending.Add("$ns ($state)") }
-        }
-        if ($pending.Count -gt 0) {
-            Write-Host ("  Still pending: {0}" -f ($pending -join ', '))
-        }
-    } while ($pending.Count -gt 0 -and (Get-Date) -lt $deadline)
-
-    if ($pending.Count -gt 0) {
-        Write-Warning ("Some providers did not finish within {0} minutes. Re-run before attempting the NMM install." -f $ProviderTimeoutMinutes)
-    } else {
-        Write-Host 'All providers are now Registered.' -ForegroundColor Green
-    }
-} else {
-    Write-Host ("{0} provider(s) are not registered:" -f $unregistered.Count) -ForegroundColor Yellow
-    foreach ($p in $unregistered) {
-        Write-Host ("  - {0}  ({1})" -f $p.Provider, $p.State) -ForegroundColor Yellow
-    }
-    Write-Host ''
-    Write-Host 'Re-run with -RegisterProviders to register them automatically.' -ForegroundColor Yellow
-    Write-Host '(Continuing with region check...)' -ForegroundColor DarkGray
-}
-Write-Host ''
-
-# --- Phase 2: Region eligibility --------------------------------------------
-Write-Banner "Phase 2: Region Eligibility"
 
 # --- 1. Authoritative region map (displayName -> slug) ----------------------
 Write-Host "Loading Azure region list..." -ForegroundColor DarkGray
@@ -516,7 +355,7 @@ $sorted   = $results | Sort-Object @{E={$_.Eligible -eq 'YES'};Descending=$true}
 $eligible = @($sorted | Where-Object { $_.Eligible -eq 'YES' })
 
 Write-Banner "Results"
-$sorted | Format-Table Region, DisplayName, AppService, SqlDb, Eligible -AutoSize | Out-Host
+$sorted | Format-Table Region, DisplayName, AppService, SqlDb, Eligible -AutoSize
 
 Write-Banner "RECOMMENDATION"
 if ($eligible.Count -gt 0) {
@@ -554,4 +393,150 @@ if ($OutFile) {
     $sorted | Export-Csv -Path $OutFile -NoTypeInformation -Encoding UTF8
     Write-Host ''
     Write-Host ("Full result table written to: {0}" -f $OutFile) -ForegroundColor Cyan
+}
+
+# --- 7. Support Ticket Filing (pass -OpenTicket to enable) ------------------
+# Targets SQL-blocked regions where the capabilities API says to open a support
+# request. One ticket per region (each restriction is subscription+region-specific).
+# Runs in the partner's Cloud Shell / subscription context on their behalf.
+
+$sqlTicketable = @($excluded | Where-Object {
+    $_.SqlDb -eq 'No' -and $_.SqlReason -match 'support.?request|provisioning is restricted'
+})
+
+if (-not $OpenTicket) {
+    if ($sqlTicketable.Count -gt 0) {
+        Write-Host ''
+        Write-Host ("TIP: {0} region(s) above have SQL provisioning restrictions that can be lifted via a support ticket." -f $sqlTicketable.Count) -ForegroundColor DarkYellow
+        Write-Host "     Re-run with -OpenTicket to file them automatically from Cloud Shell." -ForegroundColor DarkYellow
+    }
+}
+else {
+    Write-Banner "Phase 3 — Support Ticket Filing"
+
+    if ($sqlTicketable.Count -eq 0) {
+        Write-Host ''
+        Write-Host "  No SQL provisioning restrictions found — nothing to ticket." -ForegroundColor DarkGray
+    }
+    else {
+        Write-Host ''
+        Write-Host ("  {0} region(s) with SQL provisioning restrictions:" -f $sqlTicketable.Count) -ForegroundColor Yellow
+        $sqlTicketable | ForEach-Object {
+            Write-Host ("    • {0}  ({1})" -f $_.DisplayName, $_.Region) -ForegroundColor White
+        }
+
+        # Ensure the az support extension is installed (not bundled with core CLI).
+        $suppExt = az extension show --name support 2>$null | ConvertFrom-Json
+        if (-not $suppExt) {
+            Write-Host ''
+            $addExt = 'n'
+            try { $addExt = Read-Host "  'az support' extension not installed. Install now? (y/n)" -ErrorAction Stop } catch {}
+            if ($addExt -eq 'y') {
+                Write-Host "  Installing..." -ForegroundColor DarkGray
+                az extension add --name support --only-show-errors
+                $suppExt = az extension show --name support 2>$null | ConvertFrom-Json
+            }
+        }
+
+        if (-not $suppExt) {
+            # Graceful fallback: manual portal instructions.
+            Write-Host ''
+            Write-Host "  Open tickets manually:" -ForegroundColor Yellow
+            Write-Host "  Portal > Help + Support > New Support Request" -ForegroundColor White
+            Write-Host "  Issue type : Service and subscription limits (quotas)" -ForegroundColor White
+            Write-Host "  Service    : SQL Database" -ForegroundColor White
+            Write-Host ("  Region(s)  : {0}" -f ($sqlTicketable | Select-Object -ExpandProperty DisplayName) -join ', ') -ForegroundColor White
+            Write-Host ("  Sub ID     : {0}" -f $subId) -ForegroundColor White
+        }
+        else {
+            Write-Host ''
+            $doTicket = 'n'
+            try { $doTicket = Read-Host "  File support ticket(s) for these region(s)? (y/n)" -ErrorAction Stop } catch {}
+
+            if ($doTicket -eq 'y') {
+                # Collect partner contact info once; used for all tickets in this run.
+                Write-Host ''
+                Write-Host "  Partner contact information:" -ForegroundColor Cyan
+                $cFirst = Read-Host "    First name"
+                $cLast  = Read-Host "    Last name"
+                $cEmail = Read-Host "    Email"
+                $cTz    = ''
+                try { $cTz = Read-Host "    Time zone [Pacific Standard Time]" -ErrorAction Stop } catch {}
+                if ([string]::IsNullOrWhiteSpace($cTz)) { $cTz = 'Pacific Standard Time' }
+
+                # Resolve support service + best-match problem classification at runtime
+                # so no GUIDs are hardcoded. Prefers "Service and subscription limits"
+                # (correct category for provisioning restrictions) over the SQL service.
+                Write-Host ''
+                Write-Host "  Resolving Azure support classification..." -ForegroundColor DarkGray
+                $allSvc = az support services list -o json 2>$null | ConvertFrom-Json
+                $svc    = $allSvc | Where-Object { $_.displayName -match 'Service and subscription limits' } | Select-Object -First 1
+                if (-not $svc) {
+                    $svc  = $allSvc | Where-Object { $_.displayName -match 'SQL Database' -and $_.displayName -notmatch 'Managed Instance' } | Select-Object -First 1
+                }
+
+                $pcId = $null
+                $pc   = $null
+                if ($svc) {
+                    $pcs = az support services problem-classifications list --service-name $svc.name -o json 2>$null | ConvertFrom-Json
+                    $pc  = $pcs | Where-Object { $_.displayName -match 'SQL|quota|limit|provisioning|region' } | Select-Object -First 1
+                    if (-not $pc) { $pc = $pcs | Select-Object -First 1 }
+                    $pcId = if ($pc) { $pc.id } else { $null }
+                }
+
+                if (-not $pcId) {
+                    Write-Warning "  Could not resolve a problem classification. Open tickets manually:"
+                    Write-Host   "  Portal > Help + Support > New Support Request" -ForegroundColor Yellow
+                }
+                else {
+                    Write-Host ("  Classification : {0}" -f $pc.displayName) -ForegroundColor DarkGray
+                    Write-Host ''
+
+                    foreach ($r in $sqlTicketable) {
+                        $tName  = "nmm-sql-$($r.Region)-$(Get-Date -Format 'yyyyMMddHHmm')"
+                        $tTitle = "SQL Standard S1 provisioning restricted: $($r.DisplayName)"
+                        $tBody  = @"
+Requesting lift of Azure SQL Standard S1 provisioning restriction for a Nerdio Manager for MSP (NMM) Azure Marketplace deployment.
+
+Subscription : $subId
+Region       : $($r.DisplayName) ($($r.Region))
+API message  : $($r.SqlReason)
+
+NMM requires an Azure SQL Database Standard S1 (20 DTU, non-Managed-Instance). The Microsoft.Sql/locations/capabilities API reports provisioning is restricted in $($r.DisplayName) for this subscription. Please lift the restriction or advise on expected availability.
+"@
+                        Write-Host ("  Filing ticket for {0}..." -f $r.DisplayName) -ForegroundColor DarkGray
+                        $t = az support tickets create `
+                            --ticket-name              $tName `
+                            --title                    $tTitle `
+                            --description              $tBody `
+                            --problem-classification   $pcId `
+                            --severity                 "minimal" `
+                            --contact-first-name       $cFirst `
+                            --contact-last-name        $cLast `
+                            --contact-email            $cEmail `
+                            --contact-country          "USA" `
+                            --contact-phone-country-code "1" `
+                            --contact-preferred-contact-method    "email" `
+                            --contact-preferred-support-language  "en-US" `
+                            --contact-preferred-time-zone         $cTz `
+                            --only-show-errors -o json 2>$null | ConvertFrom-Json
+
+                        if ($t -and $t.name) {
+                            Write-Host ("  [OK] {0}  (status: {1})" -f $t.name, $t.status) -ForegroundColor Green
+                            if ($t.supportPlanDisplayName) {
+                                Write-Host ("       Plan : {0}" -f $t.supportPlanDisplayName) -ForegroundColor DarkGray
+                            }
+                        }
+                        else {
+                            Write-Warning "  Ticket creation failed (no paid support plan, or az support error above)."
+                            Write-Host   "  Fallback: Portal > Help + Support > New Support Request" -ForegroundColor Yellow
+                        }
+                    }
+
+                    Write-Host ''
+                    Write-Host "  Track tickets: https://portal.azure.com/#blade/Microsoft_Azure_Support/HelpAndSupportBlade/manageSupportRequest" -ForegroundColor Cyan
+                }
+            }
+        }
+    }
 }
