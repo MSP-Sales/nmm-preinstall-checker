@@ -527,23 +527,25 @@ NMM requires an Azure SQL Database Standard S1 (20 DTU, non-Managed-Instance). T
                             -Uri "$supportBase/subscriptions/$subId/providers/Microsoft.Support/supportTickets/$($tName)?api-version=$supportVer" `
                             -Headers $restHeaders -Body $ticketPayload -ErrorAction Stop
 
-                        # Ticket creation is async — verify it is retrievable before reporting success.
-                        Start-Sleep -Seconds 4
-                        $ticketUri = "$supportBase/subscriptions/$subId/providers/Microsoft.Support/supportTickets/$($tName)?api-version=$supportVer"
-                        $verify    = Invoke-RestMethod -Method GET -Uri $ticketUri -Headers $restHeaders -ErrorAction SilentlyContinue
-
-                        $finalName   = if ($verify.name)                           { $verify.name }                           else { $t.name }
-                        $finalStatus = if ($verify.properties.status)              { $verify.properties.status }              else { $t.properties.status }
-                        $finalPlan   = if ($verify.properties.supportPlanDisplayName) { $verify.properties.supportPlanDisplayName } else { $t.properties.supportPlanDisplayName }
-
-                        if ($finalName) {
-                            Write-Host ("  [OK] {0}  (status: {1})" -f $finalName, $finalStatus) -ForegroundColor Green
-                            if ($finalPlan) { Write-Host ("       Plan   : {0}" -f $finalPlan) -ForegroundColor DarkGray }
-                            Write-Host ("       Portal : https://portal.azure.com/#resource/subscriptions/$subId/providers/Microsoft.Support/supportTickets/$finalName") -ForegroundColor Cyan
+                        # PUT succeeded — report immediately; do not let a slow GET mask this.
+                        Write-Host ("  [OK] {0}  (status: {1})" -f $t.name, $t.properties.status) -ForegroundColor Green
+                        if ($t.properties.supportPlanDisplayName) {
+                            Write-Host ("       Plan   : {0}" -f $t.properties.supportPlanDisplayName) -ForegroundColor DarkGray
                         }
-                        else {
-                            Write-Warning "  PUT returned OK but ticket could not be verified — it may still appear in the portal shortly."
-                            Write-Host   ("  Check: https://portal.azure.com/#view/Microsoft_Azure_Support/HelpAndSupportBlade/~/manageSupportRequest") -ForegroundColor Yellow
+                        Write-Host ("       Portal : https://portal.azure.com/#resource/subscriptions/$subId/providers/Microsoft.Support/supportTickets/$($t.name)") -ForegroundColor Cyan
+
+                        # Best-effort verification — ticket propagation can exceed 4s; failure here is not a problem.
+                        Start-Sleep -Seconds 5
+                        try {
+                            $verify = Invoke-RestMethod -Method GET `
+                                -Uri "$supportBase/subscriptions/$subId/providers/Microsoft.Support/supportTickets/$($t.name)?api-version=$supportVer" `
+                                -Headers $restHeaders -ErrorAction Stop
+                            if ($verify.properties.status -and $verify.properties.status -ne $t.properties.status) {
+                                Write-Host ("       Verified status: {0}" -f $verify.properties.status) -ForegroundColor DarkGray
+                            }
+                        }
+                        catch {
+                            Write-Host "       (Portal link may take a few minutes to activate)" -ForegroundColor DarkGray
                         }
                     }
                     catch {
