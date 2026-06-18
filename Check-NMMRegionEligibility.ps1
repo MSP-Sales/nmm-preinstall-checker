@@ -509,20 +509,20 @@ API message  : $($r.SqlReason)
 NMM requires an Azure SQL Database Standard S1 (20 DTU, non-Managed-Instance). The Microsoft.Sql/locations/capabilities API reports provisioning is restricted in $($r.DisplayName) for this subscription. Please lift the restriction or advise on expected availability.
 "@
                         Write-Host ("  Filing ticket for {0}..." -f $r.DisplayName) -ForegroundColor DarkGray
-                        $t = az support tickets create `
-                            --ticket-name              $tName `
-                            --title                    $tTitle `
-                            --description              $tBody `
-                            --problem-classification   $pcId `
-                            --severity                 "minimal" `
-                            --contact-first-name       $cFirst `
-                            --contact-last-name        $cLast `
-                            --contact-email            $cEmail `
-                            --contact-country          "USA" `
-                            --contact-phone-country-code "1" `
-                            --contact-preferred-contact-method    "email" `
-                            --contact-preferred-support-language  "en-US" `
-                            --contact-preferred-time-zone         $cTz `
+                        $t = az support in-subscription tickets create `
+                            --ticket-name                  $tName `
+                            --title                        $tTitle `
+                            --description                  $tBody `
+                            --problem-classification       $pcId `
+                            --severity                     "minimal" `
+                            --advanced-diagnostic-consent  "Yes" `
+                            --contact-first-name           $cFirst `
+                            --contact-last-name            $cLast `
+                            --contact-email                $cEmail `
+                            --contact-country              "USA" `
+                            --contact-method               "email" `
+                            --contact-language             "en-us" `
+                            --contact-timezone             $cTz `
                             --only-show-errors -o json | ConvertFrom-Json
 
                         if ($t -and $t.name) {
