@@ -1,116 +1,129 @@
-# NMM Pre-Install Readiness Checker
+# NMM Install Pre-Flight
 
-PowerShell script that catches the three most common blockers before a partner starts the Nerdio Manager for MSP (NMM) Azure Marketplace deployment wizard.
+Scripts that de-risk a **Nerdio Manager for MSP (NMM)** Azure deployment: confirm the subscription is ready, pick a region that will actually take the install, and (optionally) run the deployment end to end.
 
-## Quick Start
+Three scripts live here:
 
-Open Cloud Shell at <https://shell.azure.com> (or the `>_` icon in the Azure portal), make sure it's in **PowerShell** mode, and paste:
+| Script | Cloud | What it does |
+|---|---|---|
+| **`preinstall_install.ps1`** (+ `template.json`) | Commercial | **End-to-end installer.** Readiness checks (Phases 0-2), region picker, ARM deployment, and post-install configuration. Has a `-CheckOnly` mode that stops after the checks. |
+| `Check-NMMRegionEligibility.ps1` | Commercial | Lightweight, single-file, **read-only** region checker. No deployment code at all. |
+| `Check-NMMPreinstall-Gov.ps1` | Azure Government (GCC-H) | Readiness checks for gov tenants. Read-only; no deployment phase yet. |
+
+---
+
+## ⚠️ Run it in the *partner's* subscription
+
+Region availability and App Service / SQL quota are **per-subscription**. The only result that matters is the one from the tenant where NMM is actually being installed. Run this in the **partner's** Azure Cloud Shell (screen-share and dictate the one-liner), not your own.
+
+---
+
+## Quick Start — installer (commercial)
+
+The installer reads its ARM template from a local `template.json`, so you download **two files** into the same directory. Open Cloud Shell at <https://shell.azure.com> (or the `>_` icon in the Azure portal), make sure it's in **PowerShell** mode, and paste:
+
+### Check only (read-only — safe to run anytime)
+
+Runs Phases 0-2 and stops before any deployment. Nothing in the subscription changes.
 
 ```powershell
-irm https://raw.githubusercontent.com/MSP-Sales/nmm-preinstall-checker/main/Check-NMMRegionEligibility.ps1 -OutFile nmm.ps1; ./nmm.ps1
+irm https://raw.githubusercontent.com/MSP-Sales/nmm-preinstall-checker/main/preinstall_install.ps1 -OutFile preinstall_install.ps1
+irm https://raw.githubusercontent.com/MSP-Sales/nmm-preinstall-checker/main/template.json -OutFile template.json
+./preinstall_install.ps1 -CheckOnly
 ```
 
-To also **register any missing resource providers automatically**, add the flag:
+### Check + install (deploys NMM)
+
+Runs the checks, lets you pick an eligible region, **asks for confirmation**, then deploys and runs post-install configuration. Requires `-ResourceGroupName`.
 
 ```powershell
-irm https://raw.githubusercontent.com/MSP-Sales/nmm-preinstall-checker/main/Check-NMMRegionEligibility.ps1 -OutFile nmm.ps1; ./nmm.ps1 -RegisterProviders
+irm https://raw.githubusercontent.com/MSP-Sales/nmm-preinstall-checker/main/preinstall_install.ps1 -OutFile preinstall_install.ps1
+irm https://raw.githubusercontent.com/MSP-Sales/nmm-preinstall-checker/main/template.json -OutFile template.json
+./preinstall_install.ps1 -ResourceGroupName nmm-rg
 ```
 
-To check a **specific geography** (skips the interactive location prompt):
-
-```powershell
-irm https://raw.githubusercontent.com/MSP-Sales/nmm-preinstall-checker/main/Check-NMMRegionEligibility.ps1 -OutFile nmm.ps1; ./nmm.ps1 -Geography US
-```
-
-To check **specific regions only** (useful when the partner has named a preference):
-
-```powershell
-irm https://raw.githubusercontent.com/MSP-Sales/nmm-preinstall-checker/main/Check-NMMRegionEligibility.ps1 -OutFile nmm.ps1; ./nmm.ps1 -Regions eastus,eastus2,centralus,westus2
-```
+> **Nothing deploys until you confirm.** After you pick a region the script prints exactly what it's about to create (resource group, region, NMM version, SKUs) and waits for a yes. Cancel and no resources are created. Pass `-Force` to skip the prompt for unattended runs.
 
 > First-time Cloud Shell users get a one-time "set up storage" prompt (~30s) — or pick the ephemeral/no-storage session. Either works.
 
 ---
 
-## GCC-H / Azure Government
+## Lightweight region check (single file, read-only)
 
-`Check-NMMPreinstall-Gov.ps1` runs the same three readiness phases against an **Azure Government (GCC-H)** subscription. It auto-detects the active cloud's API endpoints, so no hardcoded URLs — just log in to the right cloud first.
-
-Open Cloud Shell at <https://shell.azure.us> (PowerShell mode) and paste:
+If you only want the region eligibility answer and don't need the installer, `Check-NMMRegionEligibility.ps1` is a single self-contained file with no deployment code:
 
 ```powershell
-irm https://raw.githubusercontent.com/MSP-Sales/nmm-preinstall-checker/main/Check-NMMPreinstall-Gov.ps1 -OutFile nmm-gov.ps1; ./nmm-gov.ps1
+irm https://raw.githubusercontent.com/MSP-Sales/nmm-preinstall-checker/main/Check-NMMRegionEligibility.ps1 -OutFile nmm.ps1; ./nmm.ps1
 ```
 
-To also register missing providers:
+With no arguments it asks where the partner is located and checks just that geography. Skip the prompt with `-Geography US` or `-Regions eastus,centralus,westus2`.
 
-```powershell
-irm https://raw.githubusercontent.com/MSP-Sales/nmm-preinstall-checker/main/Check-NMMPreinstall-Gov.ps1 -OutFile nmm-gov.ps1; ./nmm-gov.ps1 -RegisterProviders
-```
+---
 
-Check specific gov regions:
+## 🏛️ GCC-H / Azure Government
+
+For **Azure Government (GCC-H)** partners, use `Check-NMMPreinstall-Gov.ps1`. It runs the same readiness phases (permissions, providers, region eligibility) and reads the ARM and Graph API endpoints from `az cloud show` at runtime so the bearer-token audience always matches the gov endpoints. There is **no deployment phase** for gov yet — it confirms readiness so you know which region to target.
+
+Open Cloud Shell at <https://shell.azure.us> (**PowerShell** mode) and paste:
 
 ```powershell
 irm https://raw.githubusercontent.com/MSP-Sales/nmm-preinstall-checker/main/Check-NMMPreinstall-Gov.ps1 -OutFile nmm-gov.ps1; ./nmm-gov.ps1 -Regions usgovvirginia,usgovtexas,usgovarizona
 ```
 
-> **Note:** If you're not already authenticated to the gov cloud, run `az cloud set --name AzureUSGovernment && az login` before running the script. The script will warn you if the active cloud is commercial Azure.
-
-**What's different from the commercial script:**
-- ARM and Graph API endpoints are read from `az cloud show` at runtime — the bearer token audience always matches the API being called (critical for GCC-H vs commercial endpoints).
-- All Azure Government regions fall under the US geography group; the geography prompt still works — choose "United States" or "All regions."
-- No deployment phases. An NMM ARM template for Azure Government is not yet available; this script confirms readiness so you know which region to target when it is.
+> **Check the cloud context first.** Being signed into portal.azure.us does **not** set the `az` CLI cloud. Run `az cloud show --query name -o tsv` — if it returns `AzureCloud` (commercial), run `az cloud set --name AzureUSGovernment && az login` before the script. The script also detects this and warns you. All three gov regions (Arizona, Texas, Virginia) currently pass both gates.
 
 ---
 
-## What It Checks
+## What it checks (and does)
 
 ### Phase 0 — Permissions
-Verifies the signed-in account has both:
-- **Subscription Owner** (required to register providers and complete the install)
-- **Entra ID Global Administrator** (required for the NMM install itself)
-
-Missing either will cause the install to fail. The script reports PASS / FAIL / UNKNOWN per check and calls out exactly what needs to be fixed before proceeding.
+Verifies the signed-in account has both **Subscription Owner** (to register providers and complete the install) and **Entra ID Global Administrator** (required by the NMM install itself). Reports PASS / FAIL / UNKNOWN and names exactly what to fix.
 
 ### Phase 1 — Resource Provider Registration
-Checks that all 14 providers required by NMM are registered in the subscription:
+Checks that the resource providers NMM needs are registered. Without `-RegisterProviders` it reports state only (read-only); with the flag it registers missing providers and polls until all reach **Registered** (default 15-minute timeout, `-ProviderTimeoutMinutes`).
 
-`Microsoft.KeyVault` · `Microsoft.Compute` · `Microsoft.Automation` · `Microsoft.Storage` · `Microsoft.Insights` · `Microsoft.OperationalInsights` · `Microsoft.DesktopVirtualization` · `Microsoft.Network` · `Microsoft.AAD` · `Microsoft.RecoveryServices` · `Microsoft.Web` · `Microsoft.Quota` · `Microsoft.Solutions` · `Microsoft.Sql`
-
-Without `-RegisterProviders`, the script reports state only (read-only). With the flag it registers missing providers and polls until all reach **Registered** (default 15-minute timeout, configurable with `-ProviderTimeoutMinutes`).
+> Commercial requires 14 providers including `Microsoft.Quota`. The gov script omits `Microsoft.Quota` (not a registerable namespace in GCC-H) and checks the other 13.
 
 ### Phase 2 — Region Eligibility
-With no region arguments, the script **prompts for the partner's location** (US, Canada, Europe, etc.) so you don't need to know region slugs — pass `-Geography` or `-Regions` to skip the prompt. It then surfaces which Azure regions offer **both** resources the NMM Marketplace deployment needs:
-- App Service Plan: Basic Medium (B2), Windows
-- Azure SQL Database: Standard / S1 (20 DTU)
+Surfaces which regions offer **both** resources the NMM deployment needs:
+- App Service Plan: Basic Medium (**B2**), Windows
+- Azure SQL Database: **Standard / S1** (20 DTU)
 
-Outputs a ranked table and a plain-English recommendation the SE can read directly to the partner — plus a **"Why these regions were excluded"** section. The SQL check uses the `Microsoft.Sql` capabilities REST API, which returns the human-readable *reason* a region is blocked (e.g. provisioning restricted → open a quota support request). On PowerShell 7+ (Cloud Shell) the per-region checks run in parallel.
+Outputs a ranked table plus a "Why these regions were excluded" section. The SQL check uses the `Microsoft.Sql` capabilities REST API and reports the human-readable reason a region is blocked. On PowerShell 7+ (Cloud Shell) the per-region checks run in parallel.
 
-> **Availability ≠ quota:** "Eligible" means both SKUs are *offered* in the region, not that the subscription has quota headroom — App Service capacity has no public pre-check API. If a deploy hits a quota error in an eligible region, switch to another eligible region or open an Azure support request (issue type: "Service and subscription limits (quotas)").
->
-> A quota or region-unlock request is FREE on any plan via the portal (Help + Support, New Support Request). Quota and subscription-management requests do not require a paid Azure support plan; only technical support does.
+### Phases 3-5 — Deploy (installer only, not in `-CheckOnly`)
+- **Phase 3 — Region picker:** choose one of the eligible regions.
+- **Phase 4 — Deployment:** after an explicit confirmation, deploys the NMM managed application via `template.json` and waits for the web app to come up.
+- **Phase 5 — Post-install configuration:** fetches and runs the NMM post-install configuration script pinned to `-NmmVersion`.
+
+> **Availability ≠ quota:** "Eligible" means both SKUs are *offered* in the region, not that the subscription has quota headroom — App Service capacity has no public pre-check API. If a deploy hits a quota error in an eligible region, switch to another eligible region or open an Azure support request (issue type: "Service and subscription limits (quotas)"). Quota and subscription-management requests are **free** on any plan via the portal (Help + Support → New Support Request); only technical support requires a paid plan.
 
 ---
 
 ## Parameters
 
-| Parameter | Default | Description |
-|---|---|---|
-| `-RegisterProviders` | *(off)* | Register any unregistered providers and poll to completion. The only switch that changes anything — otherwise the script is read-only. |
-| `-ProviderTimeoutMinutes` | `15` | How long to wait for provider registration |
-| `-Geography` | *(prompts)* | Limit the region check to one part of the world: `US`, `Canada`, `Mexico`, `NorthAmerica`, `Europe`, `UK`, `AsiaPacific`, `MiddleEast`, `Africa`, `SouthAmerica`, `All`. If omitted (and no `-Regions`), shows an interactive menu. |
-| `-Regions` | *(geography/all)* | Comma-separated region slugs to limit the check (e.g. `eastus,westus2`). Overrides `-Geography`. |
-| `-SubscriptionId` | *(current context)* | Target a specific subscription |
-| `-AppServiceSku` | `B2` | App Service SKU to test |
-| `-SqlEdition` | `Standard` | Azure SQL edition to test |
-| `-SqlServiceObjective` | `S1` | Azure SQL service objective to test |
-| `-OutFile` | *(none)* | Path to write a CSV of the full region results table |
+| Parameter | Applies to | Default | Description |
+|---|---|---|---|
+| `-CheckOnly` | installer | *(off)* | Run readiness checks (Phases 0-2) and stop before any deployment. No `-ResourceGroupName` needed. |
+| `-ResourceGroupName` | installer | *(required to deploy)* | Resource group for the NMM deployment. Created if it doesn't exist. Not required with `-CheckOnly`. |
+| `-NmmVersion` | installer | `6.8.0` | NMM package version to deploy and match the post-install script to. |
+| `-Force` | all | *(off)* | Skip the deploy confirmation and bypass readiness gates for unattended runs. |
+| `-RegisterProviders` | all | *(off)* | Register any unregistered providers and poll to completion. |
+| `-ProviderTimeoutMinutes` | all | `15` | How long to wait for provider registration. |
+| `-Geography` | all | *(prompts)* | Limit the region check without knowing slugs: `US`, `Canada`, `Mexico`, `NorthAmerica`, `Europe`, `UK`, `AsiaPacific`, `MiddleEast`, `Africa`, `SouthAmerica`, `All`. |
+| `-Regions` | all | *(geography/all)* | Comma-separated region slugs (e.g. `eastus,westus2`). Overrides `-Geography`. |
+| `-AppServiceSku` | all | `B2` | App Service SKU to test. |
+| `-SqlEdition` | all | `Standard` | Azure SQL edition to test. |
+| `-SqlServiceObjective` | all | `S1` | Azure SQL service objective to test. |
+| `-SubscriptionId` | all | *(current context)* | Target a specific subscription. |
+| `-OutFile` | all | *(none)* | Write the full region results table to a CSV. |
 
 ---
 
 ## Requirements
 
-- **Azure Cloud Shell** (PowerShell mode) — already authenticated, no setup needed
-- Or: local PowerShell 5.1+ with [Azure CLI](https://learn.microsoft.com/en-us/cli/azure/install-azure-cli) installed and `az login` completed
-- Account needs `Owner` on the subscription and `Global Administrator` in Entra ID to run a full NMM install (Phase 0 will flag this if missing)
-- The script is **read-only by default**; only `-RegisterProviders` makes changes (registering resource providers)
+- **Azure Cloud Shell** (PowerShell mode) — already authenticated — or local PowerShell 5.1+ with the [Azure CLI](https://learn.microsoft.com/cli/azure/install-azure-cli) installed and `az login` completed.
+- The installer's deploy phases also use the **Az PowerShell module** (present in Cloud Shell by default).
+- Account needs `Owner` on the subscription and `Global Administrator` in Entra ID to run a full install (Phase 0 flags this if missing).
+- The readiness checks are **read-only**. The only things that change the subscription are `-RegisterProviders` (registers providers) and the installer's deploy phases (which require explicit confirmation or `-Force`).
+- The installer needs **both** `preinstall_install.ps1` and `template.json` in the same working directory.
