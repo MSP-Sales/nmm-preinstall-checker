@@ -397,7 +397,7 @@ if (-not $candidates -or @($candidates).Count -eq 0) {
     return
 }
 
-$apiVersion  = '2023-05-01-preview'
+$apiVersion  = '2021-11-01'
 $candidates  = @($candidates)
 $useParallel = ($PSVersionTable.PSVersion.Major -ge 7) -and ($candidates.Count -gt 3)
 
