@@ -78,11 +78,13 @@ param(
 
 $ErrorActionPreference = 'Continue'
 
+# Microsoft.Quota is not a valid registerable namespace in Azure Government (GCC-H)
+# and is omitted from this list. All other 13 providers are available in gov cloud.
 $NmmRequiredProviders = @(
     'Microsoft.KeyVault','Microsoft.Compute','Microsoft.Automation','Microsoft.Storage',
     'Microsoft.Insights','Microsoft.OperationalInsights','Microsoft.DesktopVirtualization',
     'Microsoft.Network','Microsoft.AAD','Microsoft.RecoveryServices','Microsoft.Web',
-    'Microsoft.Quota','Microsoft.Solutions','Microsoft.Sql'
+    'Microsoft.Solutions','Microsoft.Sql'
 )
 
 # ====================================================================
