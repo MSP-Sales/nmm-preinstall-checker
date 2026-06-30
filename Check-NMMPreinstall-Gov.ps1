@@ -148,7 +148,7 @@ function Get-SqlRegionStatus {
         [string]$Edition, [string]$Slo, [string]$ApiVersion,
         [string]$ArmEndpoint = 'https://management.azure.com'
     )
-    $uri = "$ArmEndpoint/subscriptions/$Sub/providers/Microsoft.Sql/locations/$Region/capabilities?api-version=$ApiVersion&include=supportedEditions"
+    $uri = "$ArmEndpoint/subscriptions/$Sub/providers/Microsoft.Sql/locations/$Region/capabilities?api-version=$ApiVersion"
     try {
         $resp = Invoke-RestMethod -Method GET -Uri $uri -Headers @{ Authorization = "Bearer $Token" } -ErrorAction Stop
         $reason = $resp.supportedServerVersions.reason | Where-Object { $_ } | Select-Object -First 1
