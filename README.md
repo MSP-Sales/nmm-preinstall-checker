@@ -4,29 +4,62 @@ PowerShell script that catches the three most common blockers before a partner s
 
 ## Quick Start
 
-Paste this single command into **Azure Cloud Shell (PowerShell mode)**:
+Open Cloud Shell at <https://shell.azure.com> (or the `>_` icon in the Azure portal), make sure it's in **PowerShell** mode, and paste:
 
 ```powershell
-& ([scriptblock]::Create((irm 'https://raw.githubusercontent.com/MSP-Sales/nmm-preinstall-checker/main/Check-NMMRegionEligibility.ps1')))
+irm https://raw.githubusercontent.com/MSP-Sales/nmm-preinstall-checker/main/Check-NMMRegionEligibility.ps1 -OutFile nmm.ps1; ./nmm.ps1
 ```
 
 To also **register any missing resource providers automatically**, add the flag:
 
 ```powershell
-& ([scriptblock]::Create((irm 'https://raw.githubusercontent.com/MSP-Sales/nmm-preinstall-checker/main/Check-NMMRegionEligibility.ps1'))) -RegisterProviders
+irm https://raw.githubusercontent.com/MSP-Sales/nmm-preinstall-checker/main/Check-NMMRegionEligibility.ps1 -OutFile nmm.ps1; ./nmm.ps1 -RegisterProviders
 ```
 
 To check a **specific geography** (skips the interactive location prompt):
 
 ```powershell
-& ([scriptblock]::Create((irm 'https://raw.githubusercontent.com/MSP-Sales/nmm-preinstall-checker/main/Check-NMMRegionEligibility.ps1'))) -Geography US
+irm https://raw.githubusercontent.com/MSP-Sales/nmm-preinstall-checker/main/Check-NMMRegionEligibility.ps1 -OutFile nmm.ps1; ./nmm.ps1 -Geography US
 ```
 
 To check **specific regions only** (useful when the partner has named a preference):
 
 ```powershell
-& ([scriptblock]::Create((irm 'https://raw.githubusercontent.com/MSP-Sales/nmm-preinstall-checker/main/Check-NMMRegionEligibility.ps1'))) -Regions eastus,eastus2,centralus,westus2
+irm https://raw.githubusercontent.com/MSP-Sales/nmm-preinstall-checker/main/Check-NMMRegionEligibility.ps1 -OutFile nmm.ps1; ./nmm.ps1 -Regions eastus,eastus2,centralus,westus2
 ```
+
+> First-time Cloud Shell users get a one-time "set up storage" prompt (~30s) — or pick the ephemeral/no-storage session. Either works.
+
+---
+
+## GCC-H / Azure Government
+
+`Check-NMMPreinstall-Gov.ps1` runs the same three readiness phases against an **Azure Government (GCC-H)** subscription. It auto-detects the active cloud's API endpoints, so no hardcoded URLs — just log in to the right cloud first.
+
+Open Cloud Shell at <https://shell.azure.us> (PowerShell mode) and paste:
+
+```powershell
+irm https://raw.githubusercontent.com/MSP-Sales/nmm-preinstall-checker/main/Check-NMMPreinstall-Gov.ps1 -OutFile nmm-gov.ps1; ./nmm-gov.ps1
+```
+
+To also register missing providers:
+
+```powershell
+irm https://raw.githubusercontent.com/MSP-Sales/nmm-preinstall-checker/main/Check-NMMPreinstall-Gov.ps1 -OutFile nmm-gov.ps1; ./nmm-gov.ps1 -RegisterProviders
+```
+
+Check specific gov regions:
+
+```powershell
+irm https://raw.githubusercontent.com/MSP-Sales/nmm-preinstall-checker/main/Check-NMMPreinstall-Gov.ps1 -OutFile nmm-gov.ps1; ./nmm-gov.ps1 -Regions usgovvirginia,usgovtexas,usgovarizona
+```
+
+> **Note:** If you're not already authenticated to the gov cloud, run `az cloud set --name AzureUSGovernment && az login` before running the script. The script will warn you if the active cloud is commercial Azure.
+
+**What's different from the commercial script:**
+- ARM and Graph API endpoints are read from `az cloud show` at runtime — the bearer token audience always matches the API being called (critical for GCC-H vs commercial endpoints).
+- All Azure Government regions fall under the US geography group; the geography prompt still works — choose "United States" or "All regions."
+- No deployment phases. An NMM ARM template for Azure Government is not yet available; this script confirms readiness so you know which region to target when it is.
 
 ---
 
