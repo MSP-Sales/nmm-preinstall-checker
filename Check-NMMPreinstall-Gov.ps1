@@ -148,31 +148,52 @@ function Get-SqlRegionStatus {
         [string]$Edition, [string]$Slo, [string]$ApiVersion,
         [string]$ArmEndpoint = 'https://management.azure.com'
     )
+    if (-not $Sub) {
+        return [pscustomobject]@{ Region = $Region; Ok = $false; Reason = 'no subscription id resolved (internal error)' }
+    }
     # Use az rest instead of Invoke-RestMethod so auth is handled internally by
     # the az CLI — avoids bearer token audience mismatches in sovereign clouds.
     $url = "$ArmEndpoint/subscriptions/$Sub/providers/Microsoft.Sql/locations/$Region/capabilities?api-version=$ApiVersion"
     try {
-        $resp = az rest --method GET --url $url --only-show-errors 2>$null | ConvertFrom-Json
+        $resp = az rest --method GET --url $url --only-show-errors 2>$null | ConvertFrom-Json -ErrorAction Stop
         if (-not $resp) {
             return [pscustomobject]@{ Region = $Region; Ok = $false; Reason = "SQL capabilities API returned no data" }
         }
-        $reason = $resp.supportedServerVersions.reason | Where-Object { $_ } | Select-Object -First 1
-        if ($reason) { $reason = ($reason -replace '\s+', ' ').Trim() }
+        # An ARM error body (bad api-version, missing RP, empty subscription, etc.)
+        # surfaces here in place of the capabilities object — report it verbatim.
+        if ($resp.PSObject.Properties['error']) {
+            $msg = ($resp.error.message -replace '\s+', ' ').Trim()
+            return [pscustomobject]@{ Region = $Region; Ok = $false; Reason = "API error [$($resp.error.code)]: $msg" }
+        }
 
+        $serverVersions = @($resp.supportedServerVersions)
+        if ($serverVersions.Count -eq 0) {
+            # Self-diagnostic: if the schema is not what we expect, show the actual
+            # top-level keys so the parser can be adapted without a separate run.
+            $keys = ($resp.PSObject.Properties.Name | Sort-Object) -join ', '
+            return [pscustomobject]@{ Region = $Region; Ok = $false; Reason = "no supportedServerVersions; response keys=[$keys]" }
+        }
+
+        # A capability is usable unless its status is explicitly 'Disabled'.
         $sloListed = $false
-        foreach ($sv in $resp.supportedServerVersions) {
+        foreach ($sv in $serverVersions) {
             foreach ($e in $sv.supportedEditions) {
-                if ($e.name -eq $Edition) {
-                    foreach ($o in $e.supportedServiceLevelObjectives) {
-                        if ($o.name -eq $Slo) { $sloListed = $true }
-                    }
+                if ($e.name -ne $Edition) { continue }
+                foreach ($o in $e.supportedServiceLevelObjectives) {
+                    if ($o.name -eq $Slo -and $o.status -ne 'Disabled') { $sloListed = $true }
                 }
             }
         }
 
-        if ($reason)        { return [pscustomobject]@{ Region = $Region; Ok = $false; Reason = $reason } }
-        elseif ($sloListed) { return [pscustomobject]@{ Region = $Region; Ok = $true;  Reason = '' } }
-        else                { return [pscustomobject]@{ Region = $Region; Ok = $false; Reason = "$Edition/$Slo is not offered in this region" } }
+        if ($sloListed) { return [pscustomobject]@{ Region = $Region; Ok = $true; Reason = '' } }
+
+        # Not offered: list the editions that ARE available so a vCore fallback
+        # (e.g. GeneralPurpose) can be chosen if Standard/S1 is absent in gov.
+        $available = @($serverVersions | ForEach-Object { $_.supportedEditions } |
+            Where-Object { $_.status -ne 'Disabled' } |
+            Select-Object -ExpandProperty name -Unique) -join ', '
+        $detail = if ($available) { "; editions available: $available" } else { '' }
+        return [pscustomobject]@{ Region = $Region; Ok = $false; Reason = "$Edition/$Slo not offered in this region$detail" }
     } catch {
         return [pscustomobject]@{ Region = $Region; Ok = $false; Reason = "SQL capabilities error: $($_.Exception.Message)" }
     }
@@ -237,6 +258,7 @@ if ($SubscriptionId) { az account set --subscription $SubscriptionId --only-show
 
 $ctx = az account show --only-show-errors 2>$null | ConvertFrom-Json
 if (-not $ctx) { throw "Not logged in. Run 'az login' first (or 'az cloud set --name AzureUSGovernment && az login' for GCC-H)." }
+$subId = $ctx.id   # used by the Phase 2 SQL capability calls
 
 # Read API base URLs from the active cloud configuration so this script works
 # correctly for both commercial Azure and Azure Government without hardcoding.
