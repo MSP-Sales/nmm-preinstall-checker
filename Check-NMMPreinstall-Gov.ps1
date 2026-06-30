@@ -144,13 +144,18 @@ function Register-NmmProviders {
 
 function Get-SqlRegionStatus {
     param(
-        [string]$Region, [string]$Sub, [string]$Token,
+        [string]$Region, [string]$Sub,
         [string]$Edition, [string]$Slo, [string]$ApiVersion,
         [string]$ArmEndpoint = 'https://management.azure.com'
     )
-    $uri = "$ArmEndpoint/subscriptions/$Sub/providers/Microsoft.Sql/locations/$Region/capabilities?api-version=$ApiVersion"
+    # Use az rest instead of Invoke-RestMethod so auth is handled internally by
+    # the az CLI — avoids bearer token audience mismatches in sovereign clouds.
+    $url = "$ArmEndpoint/subscriptions/$Sub/providers/Microsoft.Sql/locations/$Region/capabilities?api-version=$ApiVersion"
     try {
-        $resp = Invoke-RestMethod -Method GET -Uri $uri -Headers @{ Authorization = "Bearer $Token" } -ErrorAction Stop
+        $resp = az rest --method GET --url $url --only-show-errors 2>$null | ConvertFrom-Json
+        if (-not $resp) {
+            return [pscustomobject]@{ Region = $Region; Ok = $false; Reason = "SQL capabilities API returned no data" }
+        }
         $reason = $resp.supportedServerVersions.reason | Where-Object { $_ } | Select-Object -First 1
         if ($reason) { $reason = ($reason -replace '\s+', ' ').Trim() }
 
@@ -169,7 +174,7 @@ function Get-SqlRegionStatus {
         elseif ($sloListed) { return [pscustomobject]@{ Region = $Region; Ok = $true;  Reason = '' } }
         else                { return [pscustomobject]@{ Region = $Region; Ok = $false; Reason = "$Edition/$Slo is not offered in this region" } }
     } catch {
-        return [pscustomobject]@{ Region = $Region; Ok = $false; Reason = "SQL capabilities API error: $($_.Exception.Message)" }
+        return [pscustomobject]@{ Region = $Region; Ok = $false; Reason = "SQL capabilities error: $($_.Exception.Message)" }
     }
 }
 
@@ -240,8 +245,6 @@ $armEndpoint   = $cloudInfo.endpoints.resourceManager.TrimEnd('/')
 $graphEndpoint = $cloudInfo.endpoints.microsoftGraphResourceId.TrimEnd('/')
 $cloudName     = $cloudInfo.name
 
-$token = az account get-access-token --query accessToken -o tsv 2>$null
-if (-not $token) { throw "Could not acquire Azure access token." }
 
 Write-Banner "Nerdio Manager for MSP (NMM) - Pre-Install Readiness Check"
 Write-Host ("Subscription  : {0}" -f $ctx.name)
@@ -405,7 +408,7 @@ if ($useParallel) {
     $funcDef = ${function:Get-SqlRegionStatus}.ToString()
     $sqlResults = $candidates | ForEach-Object -Parallel {
         ${function:Get-SqlRegionStatus} = $using:funcDef
-        Get-SqlRegionStatus -Region $_ -Sub $using:subId -Token $using:token `
+        Get-SqlRegionStatus -Region $_ -Sub $using:subId `
             -Edition $using:SqlEdition -Slo $using:SqlServiceObjective `
             -ApiVersion $using:apiVersion -ArmEndpoint $using:armEndpoint
     } -ThrottleLimit 15
@@ -415,7 +418,7 @@ if ($useParallel) {
     foreach ($slug in $candidates) {
         $i++
         Write-Progress -Activity "Checking SQL availability" -Status $slug -PercentComplete ([int](($i / $candidates.Count) * 100))
-        $sqlResults.Add( (Get-SqlRegionStatus -Region $slug -Sub $subId -Token $token `
+        $sqlResults.Add( (Get-SqlRegionStatus -Region $slug -Sub $subId `
             -Edition $SqlEdition -Slo $SqlServiceObjective -ApiVersion $apiVersion `
             -ArmEndpoint $armEndpoint) )
     }
