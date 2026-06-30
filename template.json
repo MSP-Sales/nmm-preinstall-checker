@@ -1,0 +1,63 @@
+{
+    "$schema": "https://schema.management.azure.com/schemas/2015-01-01/deploymentTemplate.json#",
+    "contentVersion": "1.0.0.0",
+    "parameters": {
+        "sqlServerLogin": {
+            "type": "string",
+            "defaultValue": "sqladmin",
+            "metadata": {
+                "description": "SQL Server administrator login name"
+            }
+        },
+        "sqlServerPassword": {
+            "type": "securestring",
+            "minLength": 8,
+            "maxLength": 128,
+            "metadata": {
+                "description": "SQL Server administrator password. Must be 8-128 characters and contain at least: uppercase letters (A-Z), lowercase letters (a-z), digits (0-9), and special characters (!@#$%^&*)."
+            }
+        },
+        "applicationResourceName": {
+            "type": "string",
+            "defaultValue": "nerdioMspApp"
+        },
+        "packageVersion": {
+            "type": "string",
+            "defaultValue": "6.8.0",
+            "metadata": {
+                "description": "NMM marketplace package version to deploy. Keep this in sync with the -NmmVersion parameter of the deployment script so the install and the post-install configuration script target the same version."
+            }
+        }
+    },
+    "variables": {},
+    "resources": [
+        {
+            "type": "Microsoft.Solutions/applications",
+            "apiVersion": "2021-07-01",
+            "location": "[resourceGroup().Location]",
+            "kind": "MarketPlace",
+            "name": "[parameters('applicationResourceName')]",
+            "plan": {
+                "name": "nmm-plan",
+                "product": "nmm",
+                "publisher": "nerdio",
+                "version": "[parameters('packageVersion')]"
+            },
+            "properties": {
+                "managedResourceGroupId": "[concat(subscription().id,'/resourceGroups/',take(concat(resourceGroup().name,'-',uniquestring(resourceGroup().id),uniquestring(parameters('applicationResourceName'))),90))]",
+                "parameters": {
+                    "location": {
+                        "value": "[resourceGroup().location]"
+                    },
+                    "sqlServerLogin": {
+                        "value": "[parameters('sqlServerLogin')]"
+                    },
+                    "sqlServerPassword": {
+                        "value": "[parameters('sqlServerPassword')]"
+                    }
+                },
+                "jitAccessPolicy": null
+            }
+        }
+    ]
+}
