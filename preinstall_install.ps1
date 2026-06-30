@@ -1,7 +1,7 @@
 #Requires -Version 5.1
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory)][string]$ResourceGroupName,
+    [string]$ResourceGroupName,
     [string]$AppServiceSku       = 'B2',
     [string]$SqlEdition          = 'Standard',
     [string]$SqlServiceObjective = 'S1',
@@ -12,10 +12,18 @@ param(
     [switch]$RegisterProviders,
     [int]$ProviderTimeoutMinutes = 15,
     [string]$NmmVersion          = '6.8.0',
+    [switch]$CheckOnly,
     [switch]$Force
 )
 
 $ErrorActionPreference = 'Continue'
+
+# -CheckOnly runs the read-only readiness phases (0-2) and stops before any
+# deployment. Outside CheckOnly mode a resource group name is required for the
+# Phase 4 deploy; fail fast now rather than after the checks.
+if (-not $CheckOnly -and [string]::IsNullOrWhiteSpace($ResourceGroupName)) {
+    throw "ResourceGroupName is required to deploy. Pass -ResourceGroupName <name>, or run with -CheckOnly to only run the readiness checks."
+}
 
 $NmmRequiredProviders = @(
     'Microsoft.KeyVault','Microsoft.Compute','Microsoft.Automation','Microsoft.Storage',
@@ -399,6 +407,13 @@ if ($eligible.Count -eq 0) {
     return
 }
 
+if ($CheckOnly) {
+    Write-Host ''
+    Write-Host ("Check-only mode: {0} eligible region(s) found. Stopping before deployment." -f $eligible.Count) -ForegroundColor Cyan
+    Write-Host "Re-run with -ResourceGroupName <name> (and without -CheckOnly) to deploy." -ForegroundColor DarkGray
+    return
+}
+
 # ====================================================================
 #  Phase 3: Region picker
 # ====================================================================
@@ -415,6 +430,20 @@ if (-not [int]::TryParse($pick, [ref]$idx) -or $idx -lt 1 -or $idx -gt $eligible
 }
 $Location = $eligible[$idx - 1].Region
 Write-Host ("Selected: {0} ({1})" -f $eligible[$idx - 1].DisplayName, $Location) -ForegroundColor Green
+
+# Confirmation gate: nothing has changed in the subscription up to this point.
+# Phase 4 creates real resources, so require an explicit yes (or -Force).
+Write-Host ''
+Write-Host "About to deploy NMM:" -ForegroundColor Yellow
+Write-Host ("  Resource group : {0}" -f $ResourceGroupName)
+Write-Host ("  Region         : {0} ({1})" -f $eligible[$idx - 1].DisplayName, $Location)
+Write-Host ("  NMM version    : {0}" -f $NmmVersion)
+Write-Host ("  App Service    : {0}    Azure SQL : {1}/{2}" -f $AppServiceSku, $SqlEdition, $SqlServiceObjective)
+Write-Host ''
+if (-not (Read-YesNo -Prompt "Proceed with deployment? (creates billable Azure resources)" -DefaultYes $false)) {
+    Write-Host "Deployment cancelled. No resources were created." -ForegroundColor Cyan
+    return
+}
 
 # ====================================================================
 #  Phase 4: Deployment
@@ -530,7 +559,7 @@ catch {
             Write-Host "Message:  $($_.StatusMessage)"
         }
     } else {
-        Write-Host "(No deployment record — failure occurred before submission to Azure.)"
+        Write-Host "(No deployment record - failure occurred before submission to Azure.)"
     }
 }
 finally {
