@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+#Requires -Version 7.0
 [CmdletBinding()]
 param(
     [string]$ResourceGroupName,
@@ -9,6 +9,8 @@ param(
     [string]$Geography,
     [string]$SubscriptionId,
     [string]$OutFile,
+    [string]$JsonOut,
+    [switch]$PolicyProbe,
     [switch]$RegisterProviders,
     [int]$ProviderTimeoutMinutes = 15,
     [string]$NmmVersion          = '6.8.0',
@@ -17,6 +19,40 @@ param(
 )
 
 $ErrorActionPreference = 'Continue'
+
+# ====================================================================
+#  Machine-readable report (emitted to -JsonOut). Populated per-phase so
+#  results -- including any blocking policy IDs -- flow into tickets/automation.
+# ====================================================================
+$script:report = [ordered]@{
+    timestamp        = (Get-Date -Format 'o')
+    nmmVersion       = $NmmVersion
+    checkOnly        = [bool]$CheckOnly
+    subscriptionId   = $null
+    subscriptionName = $null
+    signedInUser     = $null
+    permissions      = [ordered]@{ owner = $null; globalAdmin = $null }
+    providers        = @()
+    regions          = @()
+    selectedRegion   = $null
+    policy           = [ordered]@{
+        denyAssignments = @()
+        probe           = [ordered]@{ ran = $false; blocked = $null; blockingPolicyIds = @() }
+    }
+    deployment       = [ordered]@{ name = $null; provisioningState = $null; webAppUrl = $null }
+}
+
+function Save-Report {
+    if (-not $JsonOut) { return }
+    try {
+        $script:report | ConvertTo-Json -Depth 8 | Out-File -FilePath $JsonOut -Encoding UTF8
+    } catch {
+        Write-Warning ("Could not write JSON report to {0}: {1}" -f $JsonOut, $_.Exception.Message)
+    }
+}
+
+# Flush the report on any terminating error (e.g. a gating throw), then rethrow.
+trap { Save-Report; break }
 
 # -CheckOnly runs the read-only readiness phases (0-2) and stops before any
 # deployment. Outside CheckOnly mode a resource group name is required for the
@@ -29,8 +65,83 @@ $NmmRequiredProviders = @(
     'Microsoft.KeyVault','Microsoft.Compute','Microsoft.Automation','Microsoft.Storage',
     'Microsoft.Insights','Microsoft.OperationalInsights','Microsoft.DesktopVirtualization',
     'Microsoft.Network','Microsoft.AAD','Microsoft.RecoveryServices','Microsoft.Web',
-    'Microsoft.Quota','Microsoft.Solutions','Microsoft.Sql'
+    'Microsoft.Quota','Microsoft.Solutions','Microsoft.Sql','Microsoft.MarketplaceOrdering'
 )
+
+# ====================================================================
+#  NMM deployment template (inline)
+# ====================================================================
+# Embedded so the script is a single self-contained file -- works with a
+# Cloud Shell curl-pipe / one-liner and from any working directory (no
+# companion template.json to ship). 'packageVersion' is a template parameter
+# fed from -NmmVersion at deploy time, so the version stays single-sourced and
+# cannot drift. Single-quoted here-string: no PowerShell interpolation of the
+# ARM '$schema' / "[...]" expressions.
+$nmmTemplateJson = @'
+{
+    "$schema": "https://schema.management.azure.com/schemas/2015-01-01/deploymentTemplate.json#",
+    "contentVersion": "1.0.0.0",
+    "parameters": {
+        "sqlServerLogin": {
+            "type": "string",
+            "defaultValue": "sqladmin",
+            "metadata": {
+                "description": "SQL Server administrator login name"
+            }
+        },
+        "sqlServerPassword": {
+            "type": "securestring",
+            "minLength": 8,
+            "maxLength": 128,
+            "metadata": {
+                "description": "SQL Server administrator password. Must be 8-128 characters and contain at least: uppercase letters (A-Z), lowercase letters (a-z), digits (0-9), and special characters (!@#$%^&*)."
+            }
+        },
+        "applicationResourceName": {
+            "type": "string",
+            "defaultValue": "nerdioMspApp"
+        },
+        "packageVersion": {
+            "type": "string",
+            "defaultValue": "6.8.0",
+            "metadata": {
+                "description": "NMM marketplace package version to deploy. Fed from the script's -NmmVersion parameter so the install and the post-install configuration script target the same version."
+            }
+        }
+    },
+    "variables": {},
+    "resources": [
+        {
+            "type": "Microsoft.Solutions/applications",
+            "apiVersion": "2021-07-01",
+            "location": "[resourceGroup().Location]",
+            "kind": "MarketPlace",
+            "name": "[parameters('applicationResourceName')]",
+            "plan": {
+                "name": "nmm-plan",
+                "product": "nmm",
+                "publisher": "nerdio",
+                "version": "[parameters('packageVersion')]"
+            },
+            "properties": {
+                "managedResourceGroupId": "[concat(subscription().id,'/resourceGroups/',take(concat(resourceGroup().name,'-',uniquestring(resourceGroup().id),uniquestring(parameters('applicationResourceName'))),90))]",
+                "parameters": {
+                    "location": {
+                        "value": "[resourceGroup().location]"
+                    },
+                    "sqlServerLogin": {
+                        "value": "[parameters('sqlServerLogin')]"
+                    },
+                    "sqlServerPassword": {
+                        "value": "[parameters('sqlServerPassword')]"
+                    }
+                },
+                "jitAccessPolicy": null
+            }
+        }
+    ]
+}
+'@
 
 # ====================================================================
 #  Helper functions
@@ -134,14 +245,18 @@ function Get-SqlRegionStatus {
     }
 }
 
+# NOTE: tokens are matched against EITHER a region's metadata.geographyGroup
+# OR its metadata.geography. Azure reports UK regions with geographyGroup
+# 'Europe' and geography 'United Kingdom', so 'United Kingdom' must match on
+# the geography field, while 'Europe' (the group) already includes UK regions.
 function Resolve-Geography {
     param([string]$Token)
     switch -Regex (($Token -replace '\s', '').ToLower()) {
         '^(us|usa|unitedstates)$'              { return @('US') }
         '^canada$'                             { return @('Canada') }
         '^(northamerica|na)$'                  { return @('US','Canada','Mexico') }
-        '^(europe|eu)$'                        { return @('Europe','UK') }
-        '^(uk|unitedkingdom)$'                 { return @('UK') }
+        '^(europe|eu)$'                        { return @('Europe') }
+        '^(uk|unitedkingdom)$'                 { return @('United Kingdom') }
         '^(asiapacific|apac|asia)$'            { return @('Asia Pacific') }
         '^(middleeast|me)$'                    { return @('Middle East') }
         '^africa$'                             { return @('Africa') }
@@ -156,8 +271,8 @@ $geoMenu = [ordered]@{
     'United States'                        = @('US')
     'Canada'                               = @('Canada')
     'North America (US + Canada + Mexico)' = @('US','Canada','Mexico')
-    'Europe (incl. UK)'                    = @('Europe','UK')
-    'United Kingdom'                       = @('UK')
+    'Europe (incl. UK)'                    = @('Europe')
+    'United Kingdom'                       = @('United Kingdom')
     'Asia Pacific'                         = @('Asia Pacific')
     'Middle East'                          = @('Middle East')
     'Africa'                               = @('Africa')
@@ -184,16 +299,283 @@ function Show-GeographyPrompt {
 }
 
 # ====================================================================
+#  Policy helpers
+# ====================================================================
+
+# Resolve a policy 'effect' that may be a literal ('deny') or parameterized
+# ('[parameters('effect')]'). Best-effort: assignment param value wins, then
+# the definition's parameter defaultValue.
+function Resolve-PolicyEffect {
+    param($RawEffect, $AssignmentParams, $DefinitionParams)
+    if (-not $RawEffect) { return $null }
+    $e = "$RawEffect"
+    $m = [regex]::Match($e, "parameters\(\s*'([^']+)'\s*\)")
+    if ($m.Success) {
+        $pname = $m.Groups[1].Value
+        if ($AssignmentParams -and $AssignmentParams.PSObject.Properties[$pname]) {
+            return "$($AssignmentParams.$pname.value)"
+        }
+        if ($DefinitionParams -and $DefinitionParams.PSObject.Properties[$pname]) {
+            return "$($DefinitionParams.$pname.defaultValue)"
+        }
+        return $null
+    }
+    return $e
+}
+
+# List policy assignments in subscription scope whose (resolved) effect is Deny.
+# Best-effort for initiatives (member-parameter mapping is not fully resolved);
+# the -PolicyProbe switch is the ground-truth check. Endpoint is read from
+# 'az cloud show' so this also works in Gov/GCC-H clouds.
+function Get-DenyPolicyAssignments {
+    param([string]$Sub, [string]$Token, [string]$ArmBase)
+    $headers = @{ Authorization = "Bearer $Token" }
+    $base    = $ArmBase.TrimEnd('/')
+    $denies  = New-Object System.Collections.Generic.List[object]
+
+    try {
+        $auri = "$base/subscriptions/$Sub/providers/Microsoft.Authorization/policyAssignments?api-version=2022-06-01&`$filter=atScope()"
+        $assignments = @()
+        do {
+            $r = Invoke-RestMethod -Method GET -Uri $auri -Headers $headers -ErrorAction Stop
+            $assignments += $r.value
+            $auri = $r.nextLink
+        } while ($auri)
+    } catch {
+        return [pscustomobject]@{ Error = "Policy assignment query failed: $($_.Exception.Message)"; Denies = @() }
+    }
+
+    # Policy exemptions that apply to this subscription (atScope includes ancestors).
+    # An assignment referenced by an exemption doesn't actually enforce here.
+    $subScope    = "/subscriptions/$Sub"
+    $exemptedIds = New-Object System.Collections.Generic.HashSet[string] ([System.StringComparer]::OrdinalIgnoreCase)
+    try {
+        $exUri = "$base/subscriptions/$Sub/providers/Microsoft.Authorization/policyExemptions?api-version=2022-07-01-preview&`$filter=atScope()"
+        do {
+            $er = Invoke-RestMethod -Method GET -Uri $exUri -Headers $headers -ErrorAction Stop
+            foreach ($ex in $er.value) {
+                if ($ex.properties.policyAssignmentId) { [void]$exemptedIds.Add($ex.properties.policyAssignmentId) }
+            }
+            $exUri = $er.nextLink
+        } while ($exUri)
+    } catch {}
+
+    foreach ($a in $assignments) {
+        $defId = $a.properties.policyDefinitionId
+        if (-not $defId) { continue }
+        $assignParams = $a.properties.parameters
+
+        # Skip assignments that do not actually apply to this subscription:
+        #   1. enforcementMode = DoNotEnforce (reported/audited but not enforced)
+        #   2. this subscription is excluded via notScopes
+        #   3. a policy exemption covers this assignment
+        if ($a.properties.enforcementMode -eq 'DoNotEnforce') { continue }
+        $excluded = $false
+        foreach ($ns in @($a.properties.notScopes)) {
+            if ($ns -and ($ns -eq $subScope -or $subScope.StartsWith("$ns/", [System.StringComparison]::OrdinalIgnoreCase))) { $excluded = $true; break }
+        }
+        if ($excluded) { continue }
+        if ($a.id -and $exemptedIds.Contains($a.id)) { continue }
+
+        $def = $null
+        try { $def = Invoke-RestMethod -Method GET -Uri ("$base{0}?api-version=2021-06-01" -f $defId) -Headers $headers -ErrorAction Stop } catch {}
+        if (-not $def) { continue }
+
+        $effects = New-Object System.Collections.Generic.List[string]
+        if ($defId -match '/policySetDefinitions/') {
+            foreach ($pd in $def.properties.policyDefinitions) {
+                $mDef = $null
+                try { $mDef = Invoke-RestMethod -Method GET -Uri ("$base{0}?api-version=2021-06-01" -f $pd.policyDefinitionId) -Headers $headers -ErrorAction Stop } catch {}
+                if (-not $mDef) { continue }
+                $eff = Resolve-PolicyEffect $mDef.properties.policyRule.then.effect $assignParams $mDef.properties.parameters
+                if ($eff) { $effects.Add($eff) }
+            }
+        } else {
+            $eff = Resolve-PolicyEffect $def.properties.policyRule.then.effect $assignParams $def.properties.parameters
+            if ($eff) { $effects.Add($eff) }
+        }
+
+        if ($effects | Where-Object { $_ -match '^(?i)deny' }) {
+            $name = $a.properties.displayName
+            if (-not $name) { $name = $a.name }
+            $denies.Add([pscustomobject]@{
+                displayName        = $name
+                policyAssignmentId = $a.id
+                policyDefinitionId = $defId
+                scope              = $a.properties.scope
+                effect             = 'deny'
+            })
+        }
+    }
+    return [pscustomobject]@{ Error = $null; Denies = $denies.ToArray() }
+}
+
+# Ground-truth Deny check: deploy representative NMM resource types (storage,
+# Key Vault, SQL server) into a throwaway RG, then delete it. Captures any
+# blocking policy IDs from the deployment error. Always cleans up.
+function Invoke-PolicyProbe {
+    param([string]$Location)
+    $result   = [ordered]@{ ran = $true; blocked = $false; blockingPolicyIds = @(); error = $null }
+    $probeRg  = "nmm-policyprobe-$(Get-Date -Format 'yyyyMMddHHmmss')"
+    $depName  = "policyprobe-$(Get-Date -Format 'HHmmss')"
+    $probeTemplate = @'
+{
+    "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+    "contentVersion": "1.0.0.0",
+    "parameters": {
+        "sqlAdminPassword": { "type": "securestring" }
+    },
+    "variables": {
+        "suffix":      "[uniqueString(resourceGroup().id)]",
+        "storageName": "[toLower(concat('nmmprobe', variables('suffix')))]",
+        "kvName":      "[toLower(concat('nmmprobe-', variables('suffix')))]",
+        "sqlName":     "[toLower(concat('nmmprobe-sql-', variables('suffix')))]"
+    },
+    "resources": [
+        {
+            "type": "Microsoft.Storage/storageAccounts",
+            "apiVersion": "2023-01-01",
+            "name": "[variables('storageName')]",
+            "location": "[resourceGroup().location]",
+            "sku": { "name": "Standard_LRS" },
+            "kind": "StorageV2",
+            "properties": { "minimumTlsVersion": "TLS1_2", "allowBlobPublicAccess": false }
+        },
+        {
+            "type": "Microsoft.KeyVault/vaults",
+            "apiVersion": "2023-02-01",
+            "name": "[variables('kvName')]",
+            "location": "[resourceGroup().location]",
+            "properties": {
+                "tenantId": "[subscription().tenantId]",
+                "sku": { "family": "A", "name": "standard" },
+                "accessPolicies": [],
+                "enableSoftDelete": true
+            }
+        },
+        {
+            "type": "Microsoft.Sql/servers",
+            "apiVersion": "2022-05-01-preview",
+            "name": "[variables('sqlName')]",
+            "location": "[resourceGroup().location]",
+            "properties": {
+                "administratorLogin": "probeadmin",
+                "administratorLoginPassword": "[parameters('sqlAdminPassword')]",
+                "minimalTlsVersion": "1.2"
+            }
+        }
+    ]
+}
+'@
+    $tmpl = Join-Path ([System.IO.Path]::GetTempPath()) "nmm-policyprobe-$(Get-Random).json"
+    try {
+        $probeTemplate | Out-File -FilePath $tmpl -Encoding UTF8
+        New-AzResourceGroup -Name $probeRg -Location $Location -Force -ErrorAction Stop | Out-Null
+        try {
+            New-AzResourceGroupDeployment -Name $depName -ResourceGroupName $probeRg `
+                -TemplateFile $tmpl `
+                -TemplateParameterObject @{ sqlAdminPassword = (New-StrongPassword -Length 24) } `
+                -ErrorAction Stop | Out-Null
+            Write-Host "  Policy probe PASSED: representative resources are allowed by policy." -ForegroundColor Green
+        } catch {
+            $result.blocked = $true
+            $text = "$($_.Exception.Message)"
+            $ops  = Get-AzResourceGroupDeploymentOperation -ResourceGroupName $probeRg -DeploymentName $depName -ErrorAction SilentlyContinue
+            if ($ops) { $text += ' ' + (($ops | ForEach-Object { $_.StatusMessage }) -join ' ') }
+            $ids = [regex]::Matches($text, '/providers/Microsoft\.Authorization/policy(?:Assignments|Definitions)/[^\s"'',}]+') |
+                ForEach-Object { $_.Value } | Select-Object -Unique
+            $result.blockingPolicyIds = @($ids)
+            Write-Host "  Policy probe BLOCKED: a policy denied one or more representative resources." -ForegroundColor Red
+            if ($ids) {
+                foreach ($id in $ids) { Write-Host ("    -> {0}" -f $id) -ForegroundColor Red }
+            } else {
+                Write-Host ("    (Could not extract policy ID; raw error: {0})" -f $_.Exception.Message) -ForegroundColor DarkGray
+            }
+        }
+    } catch {
+        $result.error = "Probe setup failed: $($_.Exception.Message)"
+        Write-Warning $result.error
+    } finally {
+        Write-Host "  Cleaning up probe resource group '$probeRg' (waiting for delete)..." -ForegroundColor DarkGray
+        $null = Remove-AzResourceGroup -Name $probeRg -Force -ErrorAction SilentlyContinue
+        if ($tmpl -and (Test-Path $tmpl)) { Remove-Item $tmpl -ErrorAction SilentlyContinue }
+    }
+    return $result
+}
+
+# ====================================================================
 #  Pre-flight (az auth)
 # ====================================================================
 if (-not (Get-Command az -ErrorAction SilentlyContinue)) {
     throw "Azure CLI ('az') not found. Run in Cloud Shell or install the Azure CLI."
 }
-if ($SubscriptionId) { az account set --subscription $SubscriptionId --only-show-errors | Out-Null }
+
+# Deployment + policy-probe phases use Az PowerShell cmdlets. 'az login' does
+# NOT authenticate the Az PowerShell module, so verify the modules are present.
+# Needed for a real deploy, or for -CheckOnly -PolicyProbe (which creates/deletes
+# test resources). Pure read-only -CheckOnly skips this.
+if (-not $CheckOnly -or $PolicyProbe) {
+    $missingAzModules = @('Az.Accounts','Az.Resources','Az.Websites') |
+        Where-Object { -not (Get-Module -ListAvailable -Name $_) }
+    if ($missingAzModules.Count -gt 0) {
+        throw ("Required Az PowerShell module(s) not found: {0}. Run in Azure Cloud Shell, or install with: Install-Module Az -Scope CurrentUser" -f ($missingAzModules -join ', '))
+    }
+}
+
+# Subscription selection: honor -SubscriptionId, else auto-pick a lone sub, else
+# prompt when interactive.
+if ($SubscriptionId) {
+    az account set --subscription $SubscriptionId --only-show-errors | Out-Null
+} else {
+    $allSubs = az account list --only-show-errors 2>$null | ConvertFrom-Json
+    if (-not $allSubs -or @($allSubs).Count -eq 0) {
+        throw "No Azure subscriptions found. Run 'az login' first."
+    }
+    if (@($allSubs).Count -eq 1) {
+        $SubscriptionId = $allSubs[0].id
+        az account set --subscription $SubscriptionId --only-show-errors | Out-Null
+        Write-Host ("Using only available subscription: {0}" -f $allSubs[0].name) -ForegroundColor DarkGray
+    } elseif ([Environment]::UserInteractive) {
+        Write-Host ''
+        Write-Host "Select an Azure subscription:" -ForegroundColor Cyan
+        $defaultIdx = 1
+        for ($i = 0; $i -lt $allSubs.Count; $i++) {
+            $marker = if ($allSubs[$i].isDefault) { ' (current)' } else { '' }
+            Write-Host ("  {0,2}. {1}  [{2}]{3}" -f ($i + 1), $allSubs[$i].name, $allSubs[$i].id, $marker)
+            if ($allSubs[$i].isDefault) { $defaultIdx = $i + 1 }
+        }
+        $pick = Read-Host "Enter choice [$defaultIdx]"
+        if ([string]::IsNullOrWhiteSpace($pick)) { $pick = $defaultIdx }
+        $idx = 0
+        if (-not [int]::TryParse($pick, [ref]$idx) -or $idx -lt 1 -or $idx -gt $allSubs.Count) {
+            throw "Invalid subscription choice."
+        }
+        $SubscriptionId = $allSubs[$idx - 1].id
+        az account set --subscription $SubscriptionId --only-show-errors | Out-Null
+        Write-Host ("Selected: {0}" -f $allSubs[$idx - 1].name) -ForegroundColor Green
+    }
+}
 
 $ctx = az account show --only-show-errors 2>$null | ConvertFrom-Json
 if (-not $ctx) { throw "Not logged in. Run 'az login' first." }
 $subId = $ctx.id
+$script:report.subscriptionId   = $ctx.id
+$script:report.subscriptionName = $ctx.name
+
+# Read the ARM endpoint from the active cloud so policy/SQL REST calls work in
+# commercial AND Gov clouds.
+$armBase = az cloud show --query 'endpoints.resourceManager' -o tsv 2>$null
+if (-not $armBase) { $armBase = 'https://management.azure.com' }
+
+# Ensure the Az PowerShell module targets the same subscription (needed for a
+# deploy or for the -PolicyProbe create/delete test).
+if (-not $CheckOnly -or $PolicyProbe) {
+    if (-not (Get-AzContext -ErrorAction SilentlyContinue)) {
+        Write-Host "Az PowerShell not connected; running Connect-AzAccount..." -ForegroundColor DarkGray
+        Connect-AzAccount -SubscriptionId $subId -ErrorAction Stop | Out-Null
+    }
+    Set-AzContext -SubscriptionId $subId -ErrorAction SilentlyContinue | Out-Null
+}
 
 $token = az account get-access-token --query accessToken -o tsv 2>$null
 if (-not $token) { throw "Could not acquire Azure access token." }
@@ -216,6 +598,7 @@ if (-not $me) {
 } else {
     Write-Host ("Signed-in user : {0}  ({1})" -f $me.displayName, $me.userPrincipalName)
     Write-Host ''
+    $script:report.signedInUser = $me.userPrincipalName
     $ownerAssignments = az role assignment list `
         --assignee $me.id --role Owner --scope "/subscriptions/$($ctx.id)" `
         --include-groups --include-inherited --only-show-errors 2>$null | ConvertFrom-Json
@@ -231,6 +614,9 @@ if (-not $me) {
             $isGA = [bool]($dirRoles.value | Where-Object { $_.roleTemplateId -eq $GA_TEMPLATE_ID })
         } else { $gaNote = ' (no directory roles returned)' }
     } catch { $gaNote = ' (Graph API check failed)' }
+
+    $script:report.permissions.owner       = [bool]$isOwner
+    $script:report.permissions.globalAdmin = $isGA
 
     $ownerLabel = if ($isOwner) { 'PASS' } else { 'FAIL' }
     $gaLabel    = if ($null -eq $isGA) { "UNKNOWN$gaNote" } elseif ($isGA) { 'PASS' } else { 'FAIL' }
@@ -268,6 +654,7 @@ foreach ($ns in $NmmRequiredProviders) {
     $providerResults.Add([pscustomobject]@{ Provider = $ns; State = $state })
 }
 $providerResults | Format-Table -AutoSize | Out-Host
+$script:report.providers = @($providerResults | ForEach-Object { [ordered]@{ name = $_.Provider; state = $_.State } })
 
 $unregistered = @($providerResults | Where-Object { $_.State -ne 'Registered' })
 if ($unregistered.Count -eq 0) {
@@ -297,6 +684,13 @@ if ($unregistered.Count -eq 0) {
     } else {
         throw "Required providers are not registered. Aborting before deployment. Re-run with -RegisterProviders once resolved."
     }
+
+    # Re-snapshot provider states (they may have changed after registration).
+    $script:report.providers = @($NmmRequiredProviders | ForEach-Object {
+        $state = az provider show --namespace $_ --query registrationState --output tsv --only-show-errors 2>$null
+        if (-not $state) { $state = 'UNKNOWN' }
+        [ordered]@{ name = $_; state = $state }
+    })
 }
 
 # ====================================================================
@@ -307,11 +701,12 @@ Write-Host "Loading Azure region list..." -ForegroundColor DarkGray
 $allLocations = az account list-locations --only-show-errors 2>$null | ConvertFrom-Json
 $physical     = $allLocations | Where-Object { $_.metadata.regionType -eq 'Physical' }
 
-$nameToSlug = @{}; $slugToName = @{}; $slugToGeo = @{}
+$nameToSlug = @{}; $slugToName = @{}; $slugToGeo = @{}; $slugToGeography = @{}
 foreach ($loc in $physical) {
     $nameToSlug[$loc.displayName] = $loc.name
     $slugToName[$loc.name]        = $loc.displayName
     $slugToGeo[$loc.name]         = $loc.metadata.geographyGroup
+    $slugToGeography[$loc.name]   = $loc.metadata.geography
 }
 
 Write-Host ("Querying App Service regions that offer '{0}'..." -f $AppServiceSku) -ForegroundColor DarkGray
@@ -337,7 +732,10 @@ if ($Regions) {
     }
     $candidates = @($appSvcSlugs)
     if ($null -ne $geoGroups) {
-        $candidates = $candidates | Where-Object { $geoGroups -contains $slugToGeo[$_] }
+        # Match on either geographyGroup (e.g. 'Europe') or geography (e.g. 'United Kingdom').
+        $candidates = $candidates | Where-Object {
+            ($geoGroups -contains $slugToGeo[$_]) -or ($geoGroups -contains $slugToGeography[$_])
+        }
     }
     $candidates = $candidates | Sort-Object
     Write-Host ("Checking {0} region(s) in '{1}'..." -f $candidates.Count, $geoLabel) -ForegroundColor DarkGray
@@ -345,6 +743,7 @@ if ($Regions) {
 
 if (-not $candidates -or @($candidates).Count -eq 0) {
     Write-Host "No candidate regions to check." -ForegroundColor Yellow
+    Save-Report
     return
 }
 
@@ -394,6 +793,17 @@ foreach ($slug in $candidates) {
 $sorted   = $results | Sort-Object @{E={$_.Eligible -eq 'YES'};Descending=$true}, DisplayName
 $eligible = @($sorted | Where-Object { $_.Eligible -eq 'YES' })
 
+$script:report.regions = @($sorted | ForEach-Object {
+    [ordered]@{
+        region      = $_.Region
+        displayName = $_.DisplayName
+        appService  = ($_.AppService -eq 'Yes')
+        sqlDb       = ($_.SqlDb -eq 'Yes')
+        eligible    = ($_.Eligible -eq 'YES')
+        reasons     = @($_.SqlReason, $_.AppServiceReason | Where-Object { $_ })
+    }
+})
+
 Write-Banner "Results"
 $sorted | Format-Table Region, DisplayName, AppService, SqlDb, Eligible -AutoSize | Out-Host
 
@@ -404,13 +814,46 @@ if ($OutFile) {
 
 if ($eligible.Count -eq 0) {
     Write-Host "No region offers BOTH App Service $AppServiceSku and SQL $SqlEdition/$SqlServiceObjective. Exiting." -ForegroundColor Red
+    Save-Report
     return
 }
 
+# ====================================================================
+#  Policy Deny Check (read-only) -- part of readiness, runs in CheckOnly too
+# ====================================================================
+Write-Banner "Policy Deny Check"
+Write-Host "Querying policy assignments in subscription scope for Deny effects..." -ForegroundColor DarkGray
+$denyResult = Get-DenyPolicyAssignments -Sub $subId -Token $token -ArmBase $armBase
+if ($denyResult.Error) {
+    Write-Warning $denyResult.Error
+} elseif (@($denyResult.Denies).Count -eq 0) {
+    Write-Host "No enforced Deny policy assignments found in this hierarchy." -ForegroundColor Green
+} else {
+    Write-Host ("ADVISORY: {0} Deny policy assignment(s) exist in this subscription's management hierarchy." -f @($denyResult.Denies).Count) -ForegroundColor Yellow
+    $denyResult.Denies | Format-Table displayName, policyDefinitionId -AutoSize | Out-Host
+    Write-Host "  These MAY affect deployment, but not necessarily. Whether a deny actually blocks NMM" -ForegroundColor DarkGray
+    Write-Host "  depends on resource selectors, overrides, and resource type -- which cannot be" -ForegroundColor DarkGray
+    Write-Host "  determined by listing alone. (Microsoft-managed region/SDP gating policies commonly" -ForegroundColor DarkGray
+    Write-Host "  appear here and usually do NOT block.) Use -PolicyProbe for the ground-truth check." -ForegroundColor DarkGray
+}
+$script:report.policy.denyAssignments = @($denyResult.Denies)
+
 if ($CheckOnly) {
+    # Optional ground-truth probe without deploying NMM: create+delete test
+    # resources in the first eligible region (or a -Regions-specified one).
+    if ($PolicyProbe) {
+        $probeRegion = $eligible[0].Region
+        Write-Banner "Policy Probe (create/delete test)"
+        Write-Host ("Probing region '{0}' (first eligible; pass -Regions to target another)..." -f $probeRegion) -ForegroundColor Cyan
+        $probe = Invoke-PolicyProbe -Location $probeRegion
+        $script:report.policy.probe.ran               = $probe.ran
+        $script:report.policy.probe.blocked           = $probe.blocked
+        $script:report.policy.probe.blockingPolicyIds = @($probe.blockingPolicyIds)
+    }
     Write-Host ''
     Write-Host ("Check-only mode: {0} eligible region(s) found. Stopping before deployment." -f $eligible.Count) -ForegroundColor Cyan
     Write-Host "Re-run with -ResourceGroupName <name> (and without -CheckOnly) to deploy." -ForegroundColor DarkGray
+    Save-Report
     return
 }
 
@@ -426,10 +869,33 @@ if ([string]::IsNullOrWhiteSpace($pick)) { $pick = '1' }
 $idx = 0
 if (-not [int]::TryParse($pick, [ref]$idx) -or $idx -lt 1 -or $idx -gt $eligible.Count) {
     Write-Host "Invalid choice. Exiting." -ForegroundColor Red
+    Save-Report
     return
 }
 $Location = $eligible[$idx - 1].Region
+$script:report.selectedRegion = $Location
 Write-Host ("Selected: {0} ({1})" -f $eligible[$idx - 1].DisplayName, $Location) -ForegroundColor Green
+
+# Ground-truth policy probe (opt-in): create+delete representative resources in
+# the chosen region to confirm no policy blocks the install. Runs before the
+# deploy confirmation so a block can stop us before spending money.
+if ($PolicyProbe) {
+    Write-Banner "Policy Probe (create/delete test)"
+    Write-Host ("Creating + deleting representative resources in '{0}'..." -f $Location) -ForegroundColor Cyan
+    $probe = Invoke-PolicyProbe -Location $Location
+    $script:report.policy.probe.ran               = $probe.ran
+    $script:report.policy.probe.blocked           = $probe.blocked
+    $script:report.policy.probe.blockingPolicyIds = @($probe.blockingPolicyIds)
+    if ($probe.blocked -and -not $Force) {
+        Write-Host ''
+        Write-Host "A policy would block the NMM deployment. Resolve the policies above before continuing." -ForegroundColor Red
+        if (-not (Read-YesNo -Prompt "Continue with the deployment anyway?" -DefaultYes $false)) {
+            Write-Host "Exiting due to blocking policy." -ForegroundColor Red
+            Save-Report
+            return
+        }
+    }
+}
 
 # Confirmation gate: nothing has changed in the subscription up to this point.
 # Phase 4 creates real resources, so require an explicit yes (or -Force).
@@ -442,6 +908,7 @@ Write-Host ("  App Service    : {0}    Azure SQL : {1}/{2}" -f $AppServiceSku, $
 Write-Host ''
 if (-not (Read-YesNo -Prompt "Proceed with deployment? (creates billable Azure resources)" -DefaultYes $false)) {
     Write-Host "Deployment cancelled. No resources were created." -ForegroundColor Cyan
+    Save-Report
     return
 }
 
@@ -453,13 +920,30 @@ if (-not (Get-AzResourceGroup -Name $ResourceGroupName -ErrorAction SilentlyCont
     New-AzResourceGroup -Name $ResourceGroupName -Location $Location
 }
 
+# Accept the marketplace agreement for the managed application plan. Without
+# this the deployment can fail with MarketplacePurchaseEligibilityFailed.
+Write-Host "Accepting Azure Marketplace terms for nerdio/nmm/nmm-plan..." -ForegroundColor Cyan
+$termsOutput = az term accept --publisher nerdio --product nmm --plan nmm-plan --only-show-errors 2>&1
+if ($LASTEXITCODE -eq 0) {
+    Write-Host "Marketplace terms accepted." -ForegroundColor Green
+} else {
+    Write-Warning ("Could not accept marketplace terms: {0}" -f ($termsOutput -join ' '))
+    Write-Warning "If deployment fails with MarketplacePurchaseEligibilityFailed, the subscription type may not allow marketplace purchases (e.g. CSP/MSDN/sponsored), or a private marketplace policy may be blocking the publisher."
+}
+
 $SqlPassword    = New-StrongPassword -Length 20
 $deploymentName = "nmm-deploy-$(Get-Date -Format 'yyyyMMddHHmmss')"
+$script:report.deployment.name = $deploymentName
+
+# Materialize the inline template to a temp file for the deployment (removed in
+# the finally block below).
+$templatePath = Join-Path ([System.IO.Path]::GetTempPath()) "nmm-template-$(Get-Random).json"
+$nmmTemplateJson | Out-File -FilePath $templatePath -Encoding UTF8
 
 $job = New-AzResourceGroupDeployment `
     -Name $deploymentName `
     -ResourceGroupName $ResourceGroupName `
-    -TemplateFile .\template.json `
+    -TemplateFile $templatePath `
     -TemplateParameterObject @{ sqlServerPassword = $SqlPassword; packageVersion = $NmmVersion } `
     -AsJob
 
@@ -477,6 +961,7 @@ Write-Host ""
 try {
     $result = Receive-Job -Job $job -Wait -ErrorAction Stop
     Write-Host "Deployment succeeded ($($result.ProvisioningState))." -ForegroundColor Green
+    $script:report.deployment.provisioningState = "$($result.ProvisioningState)"
 
     # The managed app lives in $ResourceGroupName; its app components (incl. the
     # web-admin-portal App Service) live in the derived managed resource group.
@@ -493,6 +978,7 @@ try {
         $webapp = Get-AzWebApp -ResourceGroupName $managedRg | Select-Object -First 1
     }
     $url = "https://$($webapp.DefaultHostName)"
+    $script:report.deployment.webAppUrl = $url
     Write-Host "Web app URL: $url" -ForegroundColor Cyan
 
     Write-Host "Waiting for web app to respond" -NoNewline
@@ -518,7 +1004,7 @@ try {
     # Fetches a configuration script from Nerdio's maintenance endpoint
     # (keyed to the NMM package version) and runs it against this install.
     # The script version is pinned to $NmmVersion so it always matches the
-    # package deployed by template.json.
+    # package deployed by the inline template (packageVersion).
     Write-Banner "Phase 5: Post-Install Configuration"
     $maintUri  = "https://nmm-live-maintenance.azurewebsites.net/api/packages/$NmmVersion/script/install"
     $maintBody = @{
@@ -548,6 +1034,7 @@ try {
 }
 catch {
     Write-Host "Deployment failed: $_" -ForegroundColor Red
+    $script:report.deployment.provisioningState = 'Failed'
     $failed = Get-AzResourceGroupDeploymentOperation -ResourceGroupName $ResourceGroupName `
         -DeploymentName $deploymentName -ErrorAction SilentlyContinue |
         Where-Object { $_.ProvisioningState -eq 'Failed' }
@@ -564,4 +1051,9 @@ catch {
 }
 finally {
     Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+    if ($templatePath -and (Test-Path $templatePath)) {
+        Remove-Item $templatePath -ErrorAction SilentlyContinue
+    }
+    Save-Report
+    if ($JsonOut) { Write-Host ("JSON report: {0}" -f $JsonOut) -ForegroundColor Cyan }
 }
