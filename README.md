@@ -2,12 +2,11 @@
 
 Scripts that de-risk a **Nerdio Manager for MSP (NMM)** Azure deployment: confirm the subscription is ready, pick a region that will actually take the install, surface policy blockers, and (optionally) run the deployment end to end.
 
-Three scripts live here:
+Two scripts live here:
 
 | Script | Cloud | What it does |
 |---|---|---|
-| **`preinstall_install.ps1`** | Commercial | **End-to-end installer, single self-contained file.** Readiness checks (Phases 0-2), advisory policy-deny check, region picker, ARM deployment, and post-install configuration. Has a `-CheckOnly` mode that stops after the checks. |
-| `Check-NMMRegionEligibility.ps1` | Commercial | Lightweight, single-file, **read-only** region checker. No deployment code at all. |
+| **`preinstall_install.ps1`** | Commercial | **End-to-end installer, single self-contained file.** Readiness checks (Phases 0-2), advisory policy-deny check, region picker, ARM deployment, and post-install configuration. Use `-CheckOnly` to run the readiness checks and stop before any deployment. |
 | `Check-NMMPreinstall-Gov.ps1` | Azure Government (GCC-H) | Readiness checks for gov tenants. Read-only; no deployment phase yet. |
 
 ---
@@ -51,18 +50,6 @@ Add `-JsonOut <path>` to any run to write a full structured report (permissions,
 ```powershell
 ./preinstall_install.ps1 -CheckOnly -JsonOut ./nmm-readiness.json
 ```
-
----
-
-## Lightweight region check (single file, read-only)
-
-If you only want the region eligibility answer and don't need the installer, `Check-NMMRegionEligibility.ps1` is a single self-contained file with no deployment code:
-
-```powershell
-irm https://raw.githubusercontent.com/MSP-Sales/nmm-preinstall-checker/main/Check-NMMRegionEligibility.ps1 -OutFile nmm.ps1; ./nmm.ps1
-```
-
-With no arguments it asks where the partner is located and checks just that geography. Skip the prompt with `-Geography US` or `-Regions eastus,centralus,westus2`.
 
 ---
 
