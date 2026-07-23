@@ -6,8 +6,8 @@ Two scripts live here:
 
 | Script | Cloud | What it does |
 |---|---|---|
-| **`preinstall_install.ps1`** | Commercial | **End-to-end installer, single self-contained file.** Readiness checks (Phases 0-2), advisory policy-deny check, region picker, ARM deployment, and post-install configuration. Use `-CheckOnly` to run the readiness checks and stop before any deployment. |
-| `Check-NMMPreinstall-Gov.ps1` | Azure Government (GCC-H) | Readiness checks for gov tenants. Read-only; no deployment phase yet. |
+| **`preinstall_install.ps1`** | Commercial | **End-to-end installer, single self-contained file.** Readiness checks (Phases 0-2), advisory policy-deny check + `-PolicyProbe`, region picker, ARM deployment, and post-install configuration. Use `-CheckOnly` to run the readiness checks and stop before any deployment. |
+| `Check-NMMPreinstall-Gov.ps1` | Azure Government (GCC-H) | Readiness checks for gov tenants (Phases 0-2) plus the same policy-deny check + `-PolicyProbe`. CLI-only — no Az PowerShell module needed. Read-only; **no deployment phase yet** (there's no ARM template for a gov NMM install). |
 
 ---
 
@@ -55,7 +55,7 @@ Add `-JsonOut <path>` to any run to write a full structured report (permissions,
 
 ## 🏛️ GCC-H / Azure Government
 
-For **Azure Government (GCC-H)** partners, use `Check-NMMPreinstall-Gov.ps1`. It runs the same readiness phases (permissions, providers, region eligibility) and reads the ARM and Graph API endpoints from `az cloud show` at runtime so the bearer-token audience always matches the gov endpoints. There is **no deployment phase** for gov yet — it confirms readiness so you know which region to target.
+For **Azure Government (GCC-H)** partners, use `Check-NMMPreinstall-Gov.ps1`. It runs the same readiness phases (permissions, providers, region eligibility, policy deny check) and reads the ARM and Graph API endpoints from `az cloud show` at runtime so the bearer-token audience always matches the gov endpoints. There is **no deployment phase** for gov yet — there's no ARM template for a gov NMM install — so it confirms readiness and surfaces policy blockers so you know which region to target.
 
 Open Cloud Shell at <https://shell.azure.us> (**PowerShell** mode) and paste:
 
@@ -63,7 +63,15 @@ Open Cloud Shell at <https://shell.azure.us> (**PowerShell** mode) and paste:
 irm https://raw.githubusercontent.com/MSP-Sales/nmm-preinstall-checker/main/Check-NMMPreinstall-Gov.ps1 -OutFile nmm-gov.ps1; ./nmm-gov.ps1 -Regions usgovvirginia,usgovtexas,usgovarizona
 ```
 
+Add `-PolicyProbe` to also run the ground-truth check (creates + deletes representative resources in the first eligible region):
+
+```powershell
+./nmm-gov.ps1 -Regions usgovvirginia,usgovtexas,usgovarizona -PolicyProbe
+```
+
 > **Check the cloud context first.** Being signed into portal.azure.us does **not** set the `az` CLI cloud. Run `az cloud show --query name -o tsv` — if it returns `AzureCloud` (commercial), run `az cloud set --name AzureUSGovernment && az login` before the script. The script also detects this and warns you. All three gov regions (Arizona, Texas, Virginia) currently pass both gates.
+
+> The gov script's `-PolicyProbe` is **CLI-only** (`az group create` / `az deployment group create` / `az group delete`) — it does not need the Az PowerShell module, unlike the commercial installer's probe.
 
 ---
 
@@ -108,7 +116,7 @@ Lists **Deny** policy assignments in the subscription's management hierarchy tha
 |---|---|---|---|
 | `-CheckOnly` | installer | *(off)* | Run readiness checks (Phases 0-2 + advisory policy check) and stop before any deployment. No `-ResourceGroupName` needed. |
 | `-ResourceGroupName` | installer | *(required to deploy)* | Resource group for the NMM deployment. Created if it doesn't exist. Not required with `-CheckOnly`. |
-| `-PolicyProbe` | installer | *(off)* | Ground-truth policy check: create + delete representative resources to confirm what actually blocks. Works with `-CheckOnly` (probe only, no deploy). |
+| `-PolicyProbe` | all | *(off)* | Ground-truth policy check: create + delete representative resources to confirm what actually blocks. Installer: works with `-CheckOnly` (probe only, no deploy). Gov script: CLI-only, no Az PowerShell module needed. |
 | `-JsonOut` | installer | *(none)* | Write a full structured JSON report (all phases + policy findings + deployment result) to this path. |
 | `-NmmVersion` | installer | `6.8.0` | NMM package version to deploy and match the post-install script to. |
 | `-Force` | all | *(off)* | Skip the deploy confirmation and bypass readiness gates for unattended runs. |
@@ -127,7 +135,7 @@ Lists **Deny** policy assignments in the subscription's management hierarchy tha
 ## Requirements
 
 - **Azure Cloud Shell** (PowerShell mode) — already authenticated — or local **PowerShell 7.0+** with the [Azure CLI](https://learn.microsoft.com/cli/azure/install-azure-cli) installed and `az login` completed.
-- The installer's deploy phases (and `-PolicyProbe`) also use the **Az PowerShell module** (`Az.Accounts`, `Az.Resources`, `Az.Websites`) — present in Cloud Shell by default. `az login` alone does **not** authenticate Az PowerShell; the script handles this, but locally you may need `Connect-AzAccount`.
+- The installer's deploy phases (and its `-PolicyProbe`) also use the **Az PowerShell module** (`Az.Accounts`, `Az.Resources`, `Az.Websites`) — present in Cloud Shell by default. `az login` alone does **not** authenticate Az PowerShell; the script handles this, but locally you may need `Connect-AzAccount`. The **gov script's `-PolicyProbe` does not need Az PowerShell** — it's `az` CLI-only.
 - Account needs `Owner` on the subscription and `Global Administrator` in Entra ID to run a full install (Phase 0 flags this if missing).
 - The readiness checks are **read-only**. The only things that change the subscription are `-RegisterProviders` (registers providers), `-PolicyProbe` (briefly creates + deletes test resources), and the installer's deploy phases (which require explicit confirmation or `-Force`).
 - The installer is a **single file** — no companion `template.json` needed (the ARM template is embedded).
