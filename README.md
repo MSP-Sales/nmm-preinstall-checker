@@ -71,6 +71,8 @@ Add `-PolicyProbe` to also run the ground-truth check (creates + deletes represe
 
 > **Check the cloud context first.** Being signed into portal.azure.us does **not** set the `az` CLI cloud. Run `az cloud show --query name -o tsv` — if it returns `AzureCloud` (commercial), run `az cloud set --name AzureUSGovernment && az login` before the script. The script also detects this and warns you. All three gov regions (Arizona, Texas, Virginia) currently pass both gates.
 
+> **Confirm the subscription isn't a free trial before you start.** A Gov free trial ships with a B2 App Service quota of 0, and free trials aren't eligible for quota-adjustment requests — there's no increase path, only upgrading off the trial. Region/policy checks passing doesn't mean anything if the subscription can't be adjusted. See the GCC-H checklist's Step 0 for the pre-assessment gate.
+
 > The gov script's `-PolicyProbe` is **CLI-only** (`az group create` / `az deployment group create` / `az group delete`) — it does not need the Az PowerShell module, unlike the commercial installer's probe.
 
 ---
