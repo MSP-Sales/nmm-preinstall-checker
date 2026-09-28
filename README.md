@@ -23,7 +23,7 @@ Region availability and App Service / SQL quota are **per-subscription**. The on
 
 ### Check only (read-only — safe to run anytime)
 
-Runs the resource group check (if `-ResourceGroupName` is given), Phases 0-2 and the advisory policy-deny check, then stops. **Nothing in the subscription changes** — no quota requests, no Key Vault purges, no provider registration (unless you add `-RegisterProviders`).
+Runs the resource group check (if `-ResourceGroupName` is given), Phases 0-2 and the advisory policy-deny check, then stops. **Nothing in the subscription changes** — no quota requests and no Key Vault purges. The one exception: if required providers are missing, it offers to register them (or pass `-RegisterProviders`).
 
 ```powershell
 irm https://raw.githubusercontent.com/MSP-Sales/nmm-preinstall-checker/main/preinstall_install.ps1 -OutFile preinstall_install.ps1
@@ -128,7 +128,7 @@ Lists **Deny** policy assignments in the subscription's management hierarchy tha
 
 | Parameter | Applies to | Default | Description |
 |---|---|---|---|
-| `-CheckOnly` | installer | *(off)* | Run readiness checks (RG check, Phases 0-2 + advisory policy check) and stop. Report-only: no quota requests, Key Vault purges or provider registration. No `-ResourceGroupName` needed. |
+| `-CheckOnly` | installer | *(off)* | Run readiness checks (RG check, Phases 0-2 + advisory policy check) and stop. Report-only: no quota requests or Key Vault purges. Still offers to register missing providers. No `-ResourceGroupName` needed. |
 | `-ResourceGroupName` | installer | *(required to deploy)* | Resource group for the NMM deployment. Must be **new**; it's created in the region you pick. Optional with `-CheckOnly` (checked if given). |
 | `-AppServiceInstances` | installer | `1` | App Service instances the quota check needs free. |
 | `-PolicyProbe` | all | *(off)* | Ground-truth policy check: create + delete representative resources to confirm what actually blocks. Installer: works with `-CheckOnly` (probe only, no deploy). Gov script: CLI-only, no Az PowerShell module needed. |

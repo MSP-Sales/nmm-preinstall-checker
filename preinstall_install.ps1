@@ -1179,7 +1179,12 @@ if ($unregistered.Count -eq 0) {
     if ($RegisterProviders -or $Force) {
         $doRegister = $true
     } elseif ($CheckOnly) {
-        Write-Host "Check-only: not registering. Re-run with -RegisterProviders, or register them before deploying." -ForegroundColor DarkGray
+        # Check-only still offers to register (providers are a prerequisite, not a deploy);
+        # declining just reports and carries on with the remaining checks.
+        if ([Environment]::UserInteractive) { $doRegister = Read-YesNo -Prompt "Register them now?" -DefaultYes $true }
+        if (-not $doRegister) {
+            Write-Host "Not registering. Re-run with -RegisterProviders, or register them before deploying." -ForegroundColor DarkGray
+        }
     } elseif (-not [Environment]::UserInteractive) {
         throw ("{0} required provider(s) not registered. Re-run with -RegisterProviders." -f $unregistered.Count)
     } else {
