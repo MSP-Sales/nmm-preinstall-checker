@@ -1,0 +1,11 @@
+# Script output
+*.csv
+
+# Windows
+Thumbs.db
+Desktop.ini
+
+# Editor / OS cruft
+.vs/
+.vscode/
+*.swp
