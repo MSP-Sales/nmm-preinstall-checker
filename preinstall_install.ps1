@@ -863,12 +863,36 @@ if ($needAz) {
     }
 }
 
+# Azure CLI in Cloud Shell builds its subscription list once, when the session signs in.
+# 'az account list --refresh' can't re-list there (no user token cache) and silently returns
+# that snapshot, so a subscription created after Cloud Shell started never shows up.
+# 'az login --identity' re-runs the Cloud Shell sign-in (home tenant), which picks it up.
+$prevSub = az account show --query id -o tsv --only-show-errors 2>$null
+az login --identity --only-show-errors -o none 2>$null
+if ($prevSub) { az account set --subscription $prevSub --only-show-errors 2>$null }
+
 # Subscription selection: honor -SubscriptionId, else auto-pick a lone enabled
-# sub, else prompt. --refresh pulls the live list instead of the CLI cache;
-# --all includes non-Enabled subs so they're visible (but not selectable).
+# sub, else prompt. --all includes non-Enabled subs so they're visible (but not selectable).
 if (-not $SubscriptionId) {
-    $allSubs     = @(az account list --refresh --all --only-show-errors 2>$null | ConvertFrom-Json)
+    $allSubs     = @(az account list --all --only-show-errors 2>$null | ConvertFrom-Json)
     $enabledSubs = @($allSubs | Where-Object { $_.state -eq 'Enabled' })
+
+    # Subscriptions Az PowerShell can see but Azure CLI still can't (typically another tenant)
+    # can't be used by the Azure CLI checks; list them so they don't silently go missing.
+    if (Get-Command Get-AzSubscription -ErrorAction SilentlyContinue) {
+        $cliIds = @($allSubs | ForEach-Object { $_.id })
+        $psOnly = @(Get-AzSubscription -ErrorAction SilentlyContinue -WarningAction SilentlyContinue |
+            Where-Object { $_.Id -notin $cliIds })
+        if ($psOnly.Count -gt 0) {
+            Write-Host ''
+            Write-Host "Subscription(s) visible to Az PowerShell but not to Azure CLI in this session (can't be used yet):" -ForegroundColor Yellow
+            foreach ($s in $psOnly) {
+                Write-Host ("  - {0}  [{1}]  tenant {2}" -f $s.Name, $s.Id, $s.TenantId) -ForegroundColor Yellow
+            }
+            Write-Host "  To use one: run 'az login --tenant <tenant>' in Cloud Shell (or restart Cloud Shell), then re-run this script." -ForegroundColor Yellow
+        }
+    }
+
     if ($enabledSubs.Count -eq 0) {
         throw "No enabled Azure subscriptions found for this account."
     }
@@ -914,7 +938,7 @@ az account set --subscription $SubscriptionId --only-show-errors | Out-Null
 $ctx = az account show --only-show-errors 2>$null | ConvertFrom-Json
 if (-not $ctx) { throw "Not logged in. Run 'az login' first." }
 if ($ctx.id -ne $SubscriptionId -and $ctx.name -ne $SubscriptionId) {
-    throw "Azure CLI couldn't switch to subscription '$SubscriptionId' (still on '$($ctx.name)')."
+    throw "Azure CLI couldn't switch to subscription '$SubscriptionId' (still on '$($ctx.name)'). If it's in another tenant, run 'az login --tenant <tenantId>' first."
 }
 $subId = $ctx.id
 $script:report.subscriptionId   = $ctx.id
