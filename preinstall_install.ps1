@@ -45,7 +45,7 @@ $script:report = [ordered]@{
         denyAssignments = @()
         probe           = [ordered]@{ ran = $false; blocked = $null; blockingPolicyIds = @() }
     }
-    deployment       = [ordered]@{ name = $null; provisioningState = $null; webAppUrl = $null }
+    deployment       = [ordered]@{ name = $null; provisioningState = $null; webAppUrl = $null; nmmVersion = $null }   # nmmVersion: release used for post-install
 }
 
 function Save-Report {
@@ -95,10 +95,11 @@ $DeployWindowMins  = 75    # an NMM deploy + post-install takes ~45-60 min; warn
 # ====================================================================
 # Embedded so the script is a single self-contained file -- works with a
 # Cloud Shell curl-pipe / one-liner and from any working directory (no
-# companion template.json to ship). The plan version (6.8.0) is the marketplace
-# template version, which doesn't track the NMM build version, so it's fixed
-# here and in the Phase 5 post-install URL. Single-quoted here-string: no
-# PowerShell interpolation of the ARM '$schema' / "[...]" expressions.
+# companion template.json to ship). The plan version (6.8.0) is the Azure
+# Marketplace template version, which doesn't track NMM releases, so it's fixed
+# here. The Phase 5 post-install configuration uses the latest NMM release.
+# Single-quoted here-string: no PowerShell interpolation of the ARM '$schema' /
+# "[...]" expressions.
 $nmmTemplateJson = @'
 {
     "$schema": "https://schema.management.azure.com/schemas/2015-01-01/deploymentTemplate.json#",
@@ -1685,9 +1686,9 @@ if (-not $deployOk) {
 # ====================================================================
 #  Phase 5: Post-install configuration
 # ====================================================================
-# Fetches a configuration script from Nerdio's maintenance endpoint (keyed to
-# the marketplace template version, 6.8.0, same as the inline template's plan)
-# and runs it against this install.
+# Fetches a configuration script from Nerdio's maintenance endpoint for the
+# latest NMM release (looked up at run time, unlike the fixed 6.8.0 marketplace
+# template version) and runs it against this install.
 Write-Banner "Phase 5: Post-Install Configuration"
 
 # The managed app lives in $ResourceGroupName; its app components (incl. the
@@ -1731,15 +1732,42 @@ if ($ready) {
     Write-Warning "Web app didn't respond within 20 minutes. Trying the post-install configuration anyway."
 }
 
-$maintUri  = 'https://nmm-live-maintenance.azurewebsites.net/api/packages/6.8.0/script/install'
+$maintBase = 'https://nmm-live-maintenance.azurewebsites.net/api/packages'
 $maintBody = @{
     app   = $webapp.Name
     rg    = $managedRg
     subId = $subId
 } | ConvertTo-Json -Compress
 
+# Latest NMM release from Nerdio's release list. The list isn't ordered, so take the highest
+# released version. Assign before piping: Invoke-RestMethod emits the JSON array as one object.
+$nmmVersion = $null
+for ($attempt = 1; $attempt -le 3 -and -not $nmmVersion; $attempt++) {
+    try {
+        $releases   = Invoke-RestMethod -Uri $maintBase -TimeoutSec 30 -ErrorAction Stop
+        $now        = (Get-Date).ToUniversalTime()
+        $nmmVersion = @($releases | Where-Object { ($_.version -as [version]) -and (ConvertTo-UtcDate $_.releaseDate) -le $now } |
+            Sort-Object { [version]$_.version } -Descending | Select-Object -First 1).version
+    } catch {
+        if ($attempt -lt 3) { Start-Sleep -Seconds 10 }
+    }
+}
+if (-not $nmmVersion) {
+    Write-Host "Couldn't look up the latest NMM version from $maintBase, so the post-install configuration was not run." -ForegroundColor Red
+    Write-Host "Run it manually in Cloud Shell once that URL responds, replacing <version> with the highest version it lists:" -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host ("& ([ScriptBlock]::Create((Invoke-RestMethod '{0}/<version>/script/install' -Method POST -Body '{1}' -ContentType 'application/json')))" -f $maintBase, $maintBody) -ForegroundColor Gray
+    Write-Host ""
+    Save-Report
+    if ($JsonOut) { Write-Host ("JSON report: {0}" -f $JsonOut) -ForegroundColor Cyan }
+    return
+}
+$maintUri = "$maintBase/$nmmVersion/script/install"
+$script:report.deployment.nmmVersion = $nmmVersion
+
 Write-Host ("Target app   : {0}" -f $webapp.Name) -ForegroundColor DarkGray
 Write-Host ("Managed RG   : {0}" -f $managedRg)    -ForegroundColor DarkGray
+Write-Host ("NMM version  : {0} (latest release)" -f $nmmVersion) -ForegroundColor DarkGray
 Write-Host ''
 Write-Host "Next: downloading and running Nerdio's NMM post-install configuration script from a remote location." -ForegroundColor Cyan
 Write-Host "This is the command being run:" -ForegroundColor Cyan
