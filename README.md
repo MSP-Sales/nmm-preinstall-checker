@@ -6,7 +6,7 @@ Two scripts live here:
 
 | Script | Cloud | What it does |
 |---|---|---|
-| **`preinstall_install.ps1`** | Commercial | **End-to-end installer, single self-contained file, Azure Cloud Shell only.** Resource group check, readiness checks (Phases 0-2, incl. PIM timing and App Service quota), advisory policy-deny check + `-PolicyProbe`, region picker with automatic quota increase, ARM deployment, and post-install configuration. Use `-CheckOnly` to run the readiness checks and stop before any change to the subscription. |
+| **`preinstall_install.ps1`** | Commercial | **End-to-end installer, single self-contained file, Azure Cloud Shell only.** Resource group check, readiness checks (Phases 0-2, incl. PIM timing and App Service quota), advisory policy-deny check + `-PolicyProbe`, region picker with automatic quota increase and an advanced any-region option, ARM deployment, and post-install configuration. Use `-CheckOnly` to run the readiness checks and stop before any change to the subscription. |
 | `Check-NMMPreinstall-Gov.ps1` | Azure Government (GCC-H) | Readiness checks for gov tenants (Phases 0-2) plus the same policy-deny check + `-PolicyProbe`. CLI-only — no Az PowerShell module needed. Read-only; **no deployment phase yet** (there's no ARM template for a gov NMM install). |
 
 ---
@@ -39,7 +39,7 @@ irm https://raw.githubusercontent.com/MSP-Sales/nmm-preinstall-checker/main/prei
 ./preinstall_install.ps1 -ResourceGroupName nmm-rg
 ```
 
-> **Nothing deploys until you confirm.** After you pick a region the script prints exactly what it's about to do (resource group, region, NMM version, SKUs, and any quota request) and waits for a yes. Cancel and no resources are created. Pass `-Force` to skip the prompt for unattended runs.
+> **Nothing deploys until you confirm.** After you pick a region the script prints exactly what it's about to do (resource group, region, SKUs, and any quota request) and waits for a yes. Cancel and no resources are created. Pass `-Force` to skip the prompt for unattended runs.
 
 > First-time Cloud Shell users get a one-time "set up storage" prompt (~30s) — or pick the ephemeral/no-storage session. Either works.
 
@@ -102,9 +102,9 @@ Surfaces which regions offer **both** resources the NMM deployment needs:
 - App Service Plan: Basic Medium (**B2**), Windows
 - Azure SQL Database: **Standard / S1** (20 DTU)
 
-The installer also checks the subscription's **App Service quota** per region through the `Microsoft.Quota` API (the `B2 VMs` row, plus the informational *Total Regional VMs* row), needing `-AppServiceInstances` free.
+The installer also reads the subscription's **App Service quota** per region through the `Microsoft.Quota` API (the `B2 VMs` row, plus the *Total Regional VMs* row, which is informational only), needing `-AppServiceInstances` free.
 
-Each region comes out as **YES** (ready), **QUOTA** (SQL is fine and a `B2` quota row exists, but the limit is too low — fixable with a quota increase), or **no** (with the reasons). The SQL check uses the `Microsoft.Sql` capabilities REST API and reports the human-readable reason a region is blocked. SQL and quota checks run together in parallel. Region filtering matches on both Azure `geographyGroup` and `geography` (so e.g. `-Geography UK` works). If nothing is eligible, you can go back and pick a different geography.
+**Azure SQL decides eligibility.** Each region comes out as **YES** (SQL available), **QUOTA** (SQL available and a `B2` quota row exists, but the limit is too low — fixable with a quota increase), or **no** (SQL not available, with the reason). App Service quota is informational otherwise: a region with no `B2` quota row (shown as `-`) is still **YES**, because deployments into such regions succeed. The SQL check uses the `Microsoft.Sql` capabilities REST API and reports the human-readable reason a region is blocked. SQL and quota checks run together in parallel. Region filtering matches on both Azure `geographyGroup` and `geography` (so e.g. `-Geography UK` works). If nothing is eligible, the region picker still opens so you can go back, use the advanced option, or quit.
 
 ### Policy Deny Check — **advisory**
 Lists **Deny** policy assignments in the subscription's management hierarchy that *might* affect the install, filtering out the obvious non-appliers (`DoNotEnforce` mode, subscriptions excluded via `notScopes`, and policy exemptions).
@@ -116,11 +116,11 @@ Lists **Deny** policy assignments in the subscription's management hierarchy tha
 > The probe tests representative resource types, not every resource NMM creates, so a policy scoped only to a type the probe doesn't create could still surprise the real install. It catches the common cases (location/tag/SKU denies).
 
 ### Phases 3-5 — Deploy (installer only, not in `-CheckOnly`)
-- **Phase 3 — Region picker:** choose a YES or QUOTA region (or `0` to go back to geography selection). For a QUOTA region, the confirmation lists the quota increase; once you confirm, the script submits it through `Microsoft.Quota`, waits for it, and then re-reads the limit (Azure sometimes reports `Failed` on a request that still applied). If the increase doesn't apply, you can go back, continue anyway, or exit.
+- **Phase 3 — Region picker:** choose a YES or QUOTA region, `0` to go back to geography selection, `A` for the advanced option, or `Q` to quit. **Advanced** deploys to any Azure region you type, skipping the eligibility checks and the quota increase (for partners who handle quota themselves); it warns if that region failed the SQL check, and the confirmation marks it as an advanced pick. For a QUOTA region, the confirmation lists the quota increase; once you confirm, the script submits it through `Microsoft.Quota`, waits for it, and then re-reads the limit (Azure sometimes reports `Failed` on a request that still applied). If the increase doesn't apply, you can go back, continue anyway, or exit.
 - **Phase 4 — Deployment:** accepts the Azure Marketplace terms for the NMM plan, then (after an explicit confirmation) deploys the NMM managed application from the embedded ARM template and waits for the admin web app to come up.
-- **Phase 5 — Post-install configuration:** fetches and runs the NMM post-install configuration script pinned to `-NmmVersion`.
+- **Phase 5 — Post-install configuration:** prints the exact command, then downloads and runs the NMM post-install configuration script from Nerdio's endpoint.
 
-> **If the automatic quota increase fails,** raise it in the portal (Quotas → App Service → region → `B2 VMs`) or open an Azure support request (issue type: "Service and subscription limits (quotas)"). Quota and subscription-management requests are **free** on any plan via the portal (Help + Support → New Support Request); only technical support requires a paid plan. A `RoleAssignmentExists` deploy failure prints PIM-specific recovery steps.
+> **If the automatic quota increase fails,** raise it in the portal (Quotas → App Service → region → `B2 VMs` → pencil icon). A `RoleAssignmentExists` deploy failure prints PIM-specific recovery steps.
 
 ---
 
@@ -133,7 +133,6 @@ Lists **Deny** policy assignments in the subscription's management hierarchy tha
 | `-AppServiceInstances` | installer | `1` | App Service instances the quota check needs free. |
 | `-PolicyProbe` | all | *(off)* | Ground-truth policy check: create + delete representative resources to confirm what actually blocks. Installer: works with `-CheckOnly` (probe only, no deploy). Gov script: CLI-only, no Az PowerShell module needed. |
 | `-JsonOut` | installer | *(none)* | Write a full structured JSON report (all phases + policy findings + deployment result) to this path. |
-| `-NmmVersion` | installer | `6.8.0` | NMM package version to deploy and match the post-install script to. |
 | `-Force` | all | *(off)* | Skip the deploy confirmation and bypass readiness gates for unattended runs. |
 | `-RegisterProviders` | all | *(off)* | Register any unregistered providers and poll to completion. |
 | `-ProviderTimeoutMinutes` | all | `15` | How long to wait for provider registration. |
