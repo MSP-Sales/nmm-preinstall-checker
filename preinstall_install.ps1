@@ -14,6 +14,7 @@ param(
     [switch]$PolicyProbe,
     [switch]$RegisterProviders,
     [int]$ProviderTimeoutMinutes = 15,
+    [string]$NmmVersion,         # pin the post-install NMM release; default is the latest (template stays 6.8.0)
     [switch]$CheckOnly,
     [switch]$Force
 )
@@ -77,6 +78,10 @@ if (-not $CheckOnly -and [string]::IsNullOrWhiteSpace($ResourceGroupName)) {
     throw "ResourceGroupName is required to deploy. Pass -ResourceGroupName <name>, or run with -CheckOnly to only run the readiness checks."
 }
 if ($AppServiceInstances -lt 1) { $AppServiceInstances = 1 }
+if ($NmmVersion -and -not ($NmmVersion -as [version])) {
+    throw "-NmmVersion '$NmmVersion' isn't a version number (e.g. 7.3.3). Leave it out to use the latest NMM release."
+}
+$nmmLabel = if ($NmmVersion) { "$NmmVersion (pinned with -NmmVersion)" } else { 'latest release' }
 
 $NmmRequiredProviders = @(
     'Microsoft.KeyVault','Microsoft.Compute','Microsoft.Automation','Microsoft.Storage',
@@ -975,6 +980,7 @@ Write-Banner "Nerdio Manager for MSP (NMM) - Pre-Install Readiness Check"
 Write-Host ("Subscription : {0}" -f $ctx.name)
 Write-Host ("Sub ID       : {0}" -f $ctx.id)
 Write-Host ("Checking for : App Service '{0}' x{1} (quota)  +  Azure SQL '{2}/{3}'" -f $AppServiceSku, $AppServiceInstances, $SqlEdition, $SqlServiceObjective)
+Write-Host ("NMM version  : {0}, installed by the post-install step (Marketplace template: 6.8.0)" -f $nmmLabel)
 if ($CheckOnly) { Write-Host "Mode         : check only (no changes to the subscription)" -ForegroundColor DarkGray }
 if ($Force)     { Write-Host "-Force       : readiness gates will be bypassed." -ForegroundColor DarkYellow }
 Write-Host ''
@@ -1591,6 +1597,7 @@ while ($true) {
     } elseif ($sel.Eligible -eq 'UNVERIFIED') {
         Write-Host ("                   unverified: {0} quota couldn't be checked here, so the deployment might fail" -f $AppServiceSku) -ForegroundColor DarkYellow
     }
+    Write-Host ("  NMM version    : {0}, installed by the post-install step (Marketplace template: 6.8.0)" -f $nmmLabel)
     Write-Host ("  App Service    : {0} x{1}    Azure SQL : {2}/{3}" -f $AppServiceSku, $AppServiceInstances, $SqlEdition, $SqlServiceObjective)
     if ($quotaPlan) {
         Write-Host ("  Quota request  : raise {0} quota in {1} from {2} to {3} (currently {4} used) -- submitted first" -f $AppServiceSku, $Location, $quotaPlan.Current, $quotaPlan.New, $quotaPlan.Used) -ForegroundColor Yellow
@@ -1841,20 +1848,22 @@ $maintBody = @{
     subId = $subId
 } | ConvertTo-Json -Compress
 
-# Latest NMM release from Nerdio's release list. The list isn't ordered, so take the highest
-# released version. Assign before piping: Invoke-RestMethod emits the JSON array as one object.
-$nmmVersion = $null
-for ($attempt = 1; $attempt -le 3 -and -not $nmmVersion; $attempt++) {
+# NMM release for the post-install script: -NmmVersion if pinned, else the latest from Nerdio's
+# release list. The list isn't ordered, so take the highest released version. Assign before piping:
+# Invoke-RestMethod emits the JSON array as one object. ($postVersion, not $nmmVersion: PowerShell
+# variable names are case-insensitive, so that would overwrite the -NmmVersion parameter.)
+$postVersion = $NmmVersion
+for ($attempt = 1; $attempt -le 3 -and -not $postVersion; $attempt++) {
     try {
         $releases   = Invoke-RestMethod -Uri $maintBase -TimeoutSec 30 -ErrorAction Stop
         $now        = (Get-Date).ToUniversalTime()
-        $nmmVersion = @($releases | Where-Object { ($_.version -as [version]) -and (ConvertTo-UtcDate $_.releaseDate) -le $now } |
+        $postVersion = @($releases | Where-Object { ($_.version -as [version]) -and (ConvertTo-UtcDate $_.releaseDate) -le $now } |
             Sort-Object { [version]$_.version } -Descending | Select-Object -First 1).version
     } catch {
         if ($attempt -lt 3) { Start-Sleep -Seconds 10 }
     }
 }
-if (-not $nmmVersion) {
+if (-not $postVersion) {
     Write-Host "Couldn't look up the latest NMM version from $maintBase, so the post-install configuration was not run." -ForegroundColor Red
     Write-Host "Run it manually in Cloud Shell once that URL responds, replacing <version> with the highest version it lists:" -ForegroundColor Yellow
     Write-Host ""
@@ -1864,12 +1873,13 @@ if (-not $nmmVersion) {
     if ($JsonOut) { Write-Host ("JSON report: {0}" -f $JsonOut) -ForegroundColor Cyan }
     return
 }
-$maintUri = "$maintBase/$nmmVersion/script/install"
-$script:report.deployment.nmmVersion = $nmmVersion
+$maintUri = "$maintBase/$postVersion/script/install"
+$script:report.deployment.nmmVersion = $postVersion
 
 Write-Host ("Target app   : {0}" -f $webapp.Name) -ForegroundColor DarkGray
 Write-Host ("Managed RG   : {0}" -f $managedRg)    -ForegroundColor DarkGray
-Write-Host ("NMM version  : {0} (latest release)" -f $nmmVersion) -ForegroundColor DarkGray
+$verNote = if ($NmmVersion) { 'pinned with -NmmVersion' } else { 'latest release' }
+Write-Host ("NMM version  : {0} ({1})" -f $postVersion, $verNote) -ForegroundColor DarkGray
 Write-Host ''
 Write-Host "Next: downloading and running Nerdio's NMM post-install configuration script from a remote location." -ForegroundColor Cyan
 Write-Host "This is the command being run:" -ForegroundColor Cyan
