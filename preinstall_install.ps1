@@ -45,7 +45,7 @@ $script:report = [ordered]@{
         denyAssignments = @()
         probe           = [ordered]@{ ran = $false; blocked = $null; blockingPolicyIds = @() }
     }
-    deployment       = [ordered]@{ name = $null; provisioningState = $null; webAppUrl = $null; nmmVersion = $null }   # nmmVersion: release used for post-install
+    deployment       = [ordered]@{ name = $null; provisioningState = $null; webAppUrl = $null; marketplaceTerms = $null; nmmVersion = $null }   # marketplaceTerms: method that accepted, or 'failed'; nmmVersion: release used for post-install
 }
 
 function Save-Report {
@@ -1610,13 +1610,51 @@ try {
 
 # Accept the marketplace agreement for the managed application plan. Without
 # this the deployment can fail with MarketplacePurchaseEligibilityFailed.
-# ('az vm image terms accept' is the command tested against that failure.)
+# Both commands below call the same Marketplace Ordering API. 'az vm image terms' is
+# built into Azure CLI (not limited to VM images; tested against that failure), and
+# 'az term' comes from the marketplaceordering extension. Try the built-in one first,
+# fall back to the extension, and confirm the agreement with 'terms show'.
 Write-Host "Accepting Azure Marketplace terms for nerdio/nmm/nmm-plan..." -ForegroundColor Cyan
-$termsOutput = az vm image terms accept --publisher nerdio --offer nmm --plan nmm-plan --only-show-errors 2>&1
-if ($LASTEXITCODE -eq 0) {
-    Write-Host "Marketplace terms accepted." -ForegroundColor Green
-} else {
-    Write-Warning ("Could not accept marketplace terms: {0}" -f ($termsOutput -join ' '))
+function Test-NmmTermsAccepted {
+    # $true / $false from the agreement, or $null if it couldn't be read
+    $v = az vm image terms show --publisher nerdio --offer nmm --plan nmm-plan --query accepted -o tsv --only-show-errors 2>$null
+    if ($LASTEXITCODE -ne 0 -or -not $v) { return $null }
+    return ("$v".Trim() -eq 'true')
+}
+$termsMethods = @(
+    @{ Name = 'az vm image terms accept'; Run = {
+        az vm image terms accept --publisher nerdio --offer nmm --plan nmm-plan --only-show-errors -o none 2>&1
+    } }
+    @{ Name = 'az term accept'; Run = {
+        # The extension installs on first use. In a terminal Azure CLI asks first, and that prompt would be
+        # hidden behind the captured output, so allow the install without a prompt for this call only.
+        $prevDyn = $env:AZURE_EXTENSION_USE_DYNAMIC_INSTALL
+        $env:AZURE_EXTENSION_USE_DYNAMIC_INSTALL = 'yes_without_prompt'
+        try     { az term accept --publisher nerdio --product nmm --plan nmm-plan --only-show-errors -o none 2>&1 }
+        finally { $env:AZURE_EXTENSION_USE_DYNAMIC_INSTALL = $prevDyn }
+    } }
+)
+$termsOk = $false; $termsErrors = @()
+foreach ($m in $termsMethods) {
+    $termsOutput = & $m.Run
+    $termsCode   = $LASTEXITCODE
+    $accepted    = Test-NmmTermsAccepted
+    # Success if the command worked and the agreement isn't shown as unaccepted, or if it's accepted regardless
+    if (($termsCode -eq 0 -and $accepted -ne $false) -or $accepted -eq $true) {
+        $termsOk = $true
+        $how = if ($termsCode -ne 0) { 'already accepted' } elseif ($accepted) { 'confirmed' } else { "couldn't confirm with 'terms show'" }
+        Write-Host ("Marketplace terms accepted ({0}; {1})." -f $m.Name, $how) -ForegroundColor Green
+        $script:report.deployment.marketplaceTerms = $m.Name
+        break
+    }
+    $why = (($termsOutput | Out-String) -replace '\s+', ' ').Trim()
+    if (-not $why) { $why = "exit code $termsCode, agreement still not accepted" }
+    $termsErrors += ("{0}: {1}" -f $m.Name, $why)
+    Write-Host ("  {0} didn't accept the terms: {1}" -f $m.Name, $why) -ForegroundColor DarkYellow
+}
+if (-not $termsOk) {
+    $script:report.deployment.marketplaceTerms = 'failed'
+    Write-Warning "Could not accept the marketplace terms with either method."
     Write-Warning "If deployment fails with MarketplacePurchaseEligibilityFailed, the subscription type may not allow marketplace purchases (e.g. CSP/MSDN/sponsored), or a private marketplace policy may be blocking the publisher."
 }
 
