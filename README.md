@@ -102,15 +102,15 @@ Surfaces which regions offer **both** resources the NMM deployment needs:
 - App Service Plan: Basic Medium (**B2**), Windows
 - Azure SQL Database: **Standard / S1** (20 DTU)
 
-The installer also reads the subscription's **App Service quota** per region through the `Microsoft.Quota` API (the `B2 VMs` row, plus the *Total Regional VMs* row, which is informational only), needing `-AppServiceInstances` free.
+The installer also reads the subscription's **App Service quota** per region through the `Microsoft.Quota` API needing `-AppServiceInstances` free. The `B2 VMs` row decides when the region returns one. Many regions don't return a `B2 VMs` row, only *Total Regional VMs* (e.g. Austria East: 0 of 31); there the regional limit applies, and deploying within it works. The results table shows both rows (`B2Quota` and `TotalRegional`; `-` means the row wasn't returned).
 
 Each region gets one of four statuses, best first:
 
 | Status | Meaning |
 |---|---|
-| **YES** | Azure SQL available, `B2` offered, and the `B2` quota row has enough free |
-| **QUOTA** | Azure SQL available, `B2` offered, quota row too low — the automatic increase fixes it |
-| **UNVERIFIED** | Azure SQL available, `B2` offered, but no quota row was returned or the quota API errored. These can deploy (France Central has with no row), but might fail, so they're never recommended |
+| **YES** | Azure SQL available, `B2` offered, and quota has enough free: the `B2 VMs` row if the region returns one, otherwise *Total Regional VMs* |
+| **QUOTA** | Azure SQL available, `B2` offered, `B2 VMs` row too low — the automatic increase fixes it |
+| **UNVERIFIED** | Azure SQL available, `B2` offered, but quota couldn't be confirmed: no `B2 VMs` or *Total Regional VMs* row, *Total Regional VMs* full with no `B2 VMs` row, or the quota API errored. These might fail, so they're never recommended |
 | **no** | Azure SQL not available, or `B2` not offered (with the reason) |
 
 The SQL check uses the `Microsoft.Sql` capabilities REST API and reports the human-readable reason a region is blocked. SQL and quota checks run together in parallel. Region filtering matches on both Azure `geographyGroup` and `geography` (so e.g. `-Geography UK` works). If nothing is eligible, the region picker still opens so you can go back, use the advanced option, or quit. If the quota API fails in every region, a warning says so (every region then shows as UNVERIFIED).

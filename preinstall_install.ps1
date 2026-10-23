@@ -302,6 +302,7 @@ function Get-AppServiceQuotaStatus {
         SkuUsed = $null; SkuLimit = $null; TotalUsed = $null; TotalLimit = $null
         SkuRowName = ''; SkuRowCount = 0
         NeedsQuota = $false   # quota row exists but limit is too low -> fixable with a quota increase
+        QuotaSource = ''      # the row that decided: '<Sku> VMs' or 'Total Regional VMs'
     }
 
     # Follows nextLink so large result sets aren't truncated
@@ -327,7 +328,7 @@ function Get-AppServiceQuotaStatus {
         $usages = Get-All "$scope/usages?api-version=$ApiVersion"
     } catch {
         $code = $null
-        try { $code = ($_.ErrorDetails.Message | ConvertFrom-Json).error.code } catch {}
+        if ($_.ErrorDetails.Message) { try { $code = ($_.ErrorDetails.Message | ConvertFrom-Json).error.code } catch {} }
         $msg = if ($code) { "$code - $($_.Exception.Message)" } else { $_.Exception.Message }
         $out.Reason = "Quota API error: $msg"
         return $out
@@ -338,24 +339,22 @@ function Get-AppServiceQuotaStatus {
         return $out
     }
 
+    # Two rows matter. The SKU row ('B2 VMs') is the specific one and decides whenever the region returns it
+    # (e.g. germanywestcentral B2 0 of 0 -> QUOTA). Many regions return no SKU row, only 'Total Regional VMs'
+    # (e.g. austriaeast: Total 0 of 31); there the regional limit is what applies, and deploying within it works.
     $checks = @(
         @{ Key = 'Sku';   Label = "$Sku VMs";           Pattern = "^$([regex]::Escape($Sku))(\s*VMs)?$" },
         @{ Key = 'Total'; Label = 'Total Regional VMs'; Pattern = 'Total\s*Regional' }
     )
 
+    $found = @{}
     foreach ($chk in $checks) {
         $qHits = Find-Rows $quotas $chk.Pattern
         if ($chk.Key -eq 'Sku') {
             $out.SkuRowCount = $qHits.Count
             $out.SkuRowName  = (@($qHits | ForEach-Object { $_.properties.name.value }) -join ',')
         }
-        if ($qHits.Count -eq 0) {
-            # Total Regional VMs is informational; a missing row is not a blocker
-            if ($chk.Key -eq 'Total') { continue }
-            # A missing SKU row doesn't block deployment (francecentral deployed fine without one); quota is just unknown
-            $out.Reason = "No '$($chk.Label)' quota row returned for this subscription/region"
-            return $out
-        }
+        if ($qHits.Count -eq 0) { continue }
 
         # Fail closed: a missing limit counts as 0, and with several matching rows use the smallest limit
         $limits = @($qHits | ForEach-Object {
@@ -373,19 +372,33 @@ function Get-AppServiceQuotaStatus {
 
         if ($chk.Key -eq 'Sku') { $out.SkuUsed = $used;   $out.SkuLimit = $limit }
         else                    { $out.TotalUsed = $used; $out.TotalLimit = $limit }
+        $found[$chk.Key] = [pscustomobject]@{ Label = $chk.Label; Used = $used; Limit = $limit }
+    }
 
-        # Total Regional VMs is informational only (recorded for the CSV/JSON, never flags QUOTA). It shows 0/0 where it
-        # isn't populated, and the automatic increase only raises the SKU limit, so flagging on it was misleading.
-        if ($chk.Key -eq 'Total') { continue }
+    function Test-Short($q) { $q.Limit -lt $Required -or ($q.Limit - $q.Used) -lt $Required }
 
-        if ($limit -lt $Required -or ($limit - $used) -lt $Required) {
-            $out.Reason     = "$($chk.Label): $used of $limit used, need $Required free (quota increase needed)"
+    if ($found['Sku']) {
+        # When the SKU row exists, Total Regional VMs is informational: it shows 0/0 where it isn't populated
+        $q = $found['Sku']; $out.QuotaSource = $q.Label
+        if (Test-Short $q) {
+            $out.Reason     = "$($q.Label): $($q.Used) of $($q.Limit) used, need $Required free (quota increase needed)"
             $out.NeedsQuota = $true
             return $out
         }
+        $out.Ok = $true
+        return $out
     }
-
-    $out.Ok = $true
+    if ($found['Total']) {
+        $q = $found['Total']; $out.QuotaSource = $q.Label
+        if (Test-Short $q) {
+            # The automatic increase raises the SKU row, which this region doesn't return, so it can't fix this
+            $out.Reason = "No '$Sku VMs' row, and $($q.Label) is $($q.Used) of $($q.Limit) used (need $Required free)"
+            return $out
+        }
+        $out.Ok = $true
+        return $out
+    }
+    $out.Reason = "No '$Sku VMs' or 'Total Regional VMs' quota row returned for this subscription/region"
     return $out
 }
 
@@ -1376,10 +1389,11 @@ while ($true) {
     }
 
     # Eligibility, best first:
-    #   YES         SQL ok, App Service SKU offered, quota row present with enough free
-    #   QUOTA       SQL ok, SKU offered, quota row too low (the automatic increase fixes it)
-    #   UNVERIFIED  SQL ok, SKU offered, but no quota row or the quota API errored. These can still
-    #               deploy (francecentral did with no row), so they're selectable but never recommended.
+    #   YES         SQL ok, App Service SKU offered, quota with enough free: the SKU row ('B2 VMs') if the
+    #               region returns one, otherwise the 'Total Regional VMs' row
+    #   QUOTA       SQL ok, SKU offered, SKU row too low (the automatic increase fixes it)
+    #   UNVERIFIED  SQL ok, SKU offered, but quota couldn't be confirmed: no quota rows, Total Regional VMs
+    #               full with no SKU row, or the quota API errored. Selectable but never recommended.
     #   no          SQL unavailable, or the SKU isn't offered in the region
     $results = New-Object System.Collections.Generic.List[object]
     foreach ($slug in $candidates) {
@@ -1409,6 +1423,7 @@ while ($true) {
             SkuRowName       = if ($app) { $app.SkuRowName } else { '' }
             SkuRowCount      = if ($app) { $app.SkuRowCount } else { 0 }
             TotalRegional    = $totalQuota
+            QuotaSource      = if ($app) { $app.QuotaSource } else { '' }
         })
     }
 
@@ -1429,18 +1444,20 @@ while ($true) {
             appService          = $_.AppService
             appServiceQuota     = $_.$quotaCol
             totalRegionalQuota  = $_.TotalRegional
+            quotaSource         = $_.QuotaSource
             sqlDb               = ($_.SqlDb -eq 'Yes')
             reasons             = @($_.SqlReason, $_.AppServiceReason | Where-Object { $_ })
         }
     })
 
     Write-Banner "Results"
-    $sorted | Format-Table Region, DisplayName, $quotaCol, SqlDb, Eligible -AutoSize | Out-Host
+    $sorted | Format-Table Region, DisplayName, $quotaCol, TotalRegional, SqlDb, Eligible -AutoSize | Out-Host
+    Write-Host ("App Service quota: the {0} VMs row ({1}) decides when the region returns one; otherwise Total Regional VMs (TotalRegional) does. '-' = row not returned." -f $AppServiceSku, $quotaCol) -ForegroundColor DarkGray
 
     if (@($sorted | Where-Object Eligible -eq 'UNVERIFIED').Count -gt 0) {
-        Write-Host ("UNVERIFIED: Azure SQL is available, but the App Service {0} quota couldn't be read (no quota row, or the quota API errored). These regions can deploy but might fail, so they aren't recommended." -f $AppServiceSku) -ForegroundColor DarkGray
-        Write-Host ''
+        Write-Host ("UNVERIFIED: Azure SQL is available, but App Service quota couldn't be confirmed (no {0} VMs or Total Regional VMs row, Total Regional VMs full with no {0} VMs row, or the quota API errored). These regions might fail, so they aren't recommended." -f $AppServiceSku) -ForegroundColor DarkGray
     }
+    Write-Host ''
 
     $ineligible = @($sorted | Where-Object { $_.Eligible -eq 'no' })
     if ($ineligible.Count -gt 0) {
@@ -1497,14 +1514,14 @@ while ($true) {
     if ($eligible.Count -eq 0) {
         Write-Host "No region in this selection has both Azure SQL $SqlEdition/$SqlServiceObjective and App Service $AppServiceSku available." -ForegroundColor Red
     } elseif ($recommended.Count -eq 0) {
-        Write-Host "No recommended region in this selection: none has confirmed App Service $AppServiceSku quota. The unverified regions below might fail." -ForegroundColor Yellow
+        Write-Host "No recommended region in this selection: none has confirmed App Service quota. The unverified regions below might fail." -ForegroundColor Yellow
     }
     for ($i = 0; $i -lt $eligible.Count; $i++) {
         $e = $eligible[$i]
         if ($e.Eligible -eq 'QUOTA') {
             Write-Host ("  {0,2}. {1}  ({2})  [needs {3} quota increase, currently {4} - requested automatically after you confirm]" -f ($i + 1), $e.DisplayName, $e.Region, $AppServiceSku, $e.$quotaCol) -ForegroundColor Yellow
         } elseif ($e.Eligible -eq 'UNVERIFIED') {
-            Write-Host ("  {0,2}. {1}  ({2})  [unverified: {3} quota couldn't be checked - might fail]" -f ($i + 1), $e.DisplayName, $e.Region, $AppServiceSku) -ForegroundColor DarkYellow
+            Write-Host ("  {0,2}. {1}  ({2})  [unverified: App Service quota couldn't be confirmed - might fail]" -f ($i + 1), $e.DisplayName, $e.Region) -ForegroundColor DarkYellow
         } else {
             Write-Host ("  {0,2}. {1}  ({2})" -f ($i + 1), $e.DisplayName, $e.Region)
         }
@@ -1595,7 +1612,7 @@ while ($true) {
     if ($advanced) {
         Write-Host "                   advanced pick: eligibility checks skipped, quota and capacity not verified" -ForegroundColor DarkYellow
     } elseif ($sel.Eligible -eq 'UNVERIFIED') {
-        Write-Host ("                   unverified: {0} quota couldn't be checked here, so the deployment might fail" -f $AppServiceSku) -ForegroundColor DarkYellow
+        Write-Host "                   unverified: App Service quota couldn't be confirmed here, so the deployment might fail" -ForegroundColor DarkYellow
     }
     Write-Host ("  NMM version    : {0}, installed by the post-install step (Marketplace template: 6.8.0)" -f $nmmLabel)
     Write-Host ("  App Service    : {0} x{1}    Azure SQL : {2}/{3}" -f $AppServiceSku, $AppServiceInstances, $SqlEdition, $SqlServiceObjective)
