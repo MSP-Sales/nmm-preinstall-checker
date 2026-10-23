@@ -537,6 +537,12 @@ function Select-AnyRegion {
         Write-Host "  $region wasn't included in the checks above." -ForegroundColor DarkGray
     } elseif ($known.SqlDb -ne 'Yes') {
         Write-Warning ("Azure SQL check for {0}: {1}" -f $region, $known.SqlReason)
+    } elseif ($known.Eligible -eq 'no') {
+        Write-Warning ("App Service {0} isn't offered in {1}." -f $AppServiceSku, $region)
+    } elseif ($known.Eligible -eq 'QUOTA') {
+        Write-Warning ("App Service quota in {0}: {1}. The advanced option doesn't request the increase." -f $region, $known.AppServiceReason)
+    } elseif ($known.Eligible -eq 'UNVERIFIED') {
+        Write-Warning ("App Service {0} quota for {1} couldn't be verified: {2}" -f $AppServiceSku, $region, $known.AppServiceReason)
     }
     return [pscustomobject]@{ Region = $region; DisplayName = $slugToName[$region]; Eligible = 'ADVANCED' }
 }
@@ -1355,8 +1361,20 @@ while ($true) {
     $sqlByRegion = @{}; $appByRegion = @{}
     foreach ($c in $checkResults) { $sqlByRegion[$c.Region] = $c.Sql; $appByRegion[$c.Region] = $c.App }
 
-    # Eligibility is decided by Azure SQL alone. App Service quota data is informational: a region with no
-    # quota row (shown as '-') can still deploy. Only a real quota row with too low a limit is flagged QUOTA.
+    # If the Quota API failed in EVERY region, the problem is the API call itself
+    # (unsupported scope, auth, registration), not the subscription's quota.
+    $appQuotaResults = @($checkResults | ForEach-Object { $_.App } | Where-Object { $_ })
+    if ($appQuotaResults.Count -gt 0 -and
+        @($appQuotaResults | Where-Object { $_.Reason -like 'Quota API error*' }).Count -eq $appQuotaResults.Count) {
+        Write-Warning "App Service quota API failed in every region, so every region shows as UNVERIFIED. First error: $($appQuotaResults[0].Reason)"
+    }
+
+    # Eligibility, best first:
+    #   YES         SQL ok, App Service SKU offered, quota row present with enough free
+    #   QUOTA       SQL ok, SKU offered, quota row too low (the automatic increase fixes it)
+    #   UNVERIFIED  SQL ok, SKU offered, but no quota row or the quota API errored. These can still
+    #               deploy (francecentral did with no row), so they're selectable but never recommended.
+    #   no          SQL unavailable, or the SKU isn't offered in the region
     $results = New-Object System.Collections.Generic.List[object]
     foreach ($slug in $candidates) {
         $offered   = $appSvcSlugs.Contains($slug)
@@ -1368,7 +1386,7 @@ while ($true) {
         $display   = if ($slugToName.ContainsKey($slug)) { $slugToName[$slug] } else { $slug }
         $appReason = if (-not $offered) { "App Service $AppServiceSku not offered" }
                      elseif ($app) { $app.Reason }
-                     else { '' }
+                     else { 'no App Service quota result' }
         $skuQuota   = '-'
         if ($app -and $null -ne $app.SkuLimit)   { $skuQuota   = '{0}/{1}' -f $app.SkuUsed, $app.SkuLimit }
         $totalQuota = '-'
@@ -1379,7 +1397,7 @@ while ($true) {
             AppService       = if ($appOk) { 'Yes' } elseif ($appQuota) { 'Quota' } else { 'No' }
             $quotaCol        = $skuQuota
             SqlDb            = if ($sqlOk) { 'Yes' } else { 'No' }
-            Eligible         = if (-not $sqlOk) { 'no' } elseif ($appQuota) { 'QUOTA' } else { 'YES' }
+            Eligible         = if (-not $sqlOk -or -not $offered) { 'no' } elseif ($appOk) { 'YES' } elseif ($appQuota) { 'QUOTA' } else { 'UNVERIFIED' }
             SqlReason        = if ($sqlOk) { '' } else { if ($sql) { $sql.Reason } else { 'no SQL result' } }
             AppServiceReason = $appReason
             SkuRowName       = if ($app) { $app.SkuRowName } else { '' }
@@ -1388,10 +1406,11 @@ while ($true) {
         })
     }
 
-    $eligRank = @{ 'YES' = 0; 'QUOTA' = 1; 'no' = 2 }
+    $eligRank = @{ 'YES' = 0; 'QUOTA' = 1; 'UNVERIFIED' = 2; 'no' = 3 }
     $sorted   = @($results | Sort-Object @{E={ $eligRank[$_.Eligible] }}, DisplayName)
-    # Regions that only need a quota increase are still offered in the picker, with a note
-    $eligible = @($sorted | Where-Object { $_.Eligible -eq 'YES' -or $_.Eligible -eq 'QUOTA' })
+    # The picker offers YES, QUOTA and UNVERIFIED regions (in that order); only YES and QUOTA are recommended
+    $eligible    = @($sorted | Where-Object { $_.Eligible -in 'YES', 'QUOTA', 'UNVERIFIED' })
+    $recommended = @($eligible | Where-Object { $_.Eligible -in 'YES', 'QUOTA' })
 
     $script:report.regions = @($sorted | ForEach-Object {
         [ordered]@{
@@ -1400,6 +1419,7 @@ while ($true) {
             status              = $_.Eligible
             eligible            = ($_.Eligible -eq 'YES')
             quotaIncreaseNeeded = ($_.Eligible -eq 'QUOTA')
+            quotaUnverified     = ($_.Eligible -eq 'UNVERIFIED')
             appService          = $_.AppService
             appServiceQuota     = $_.$quotaCol
             totalRegionalQuota  = $_.TotalRegional
@@ -1411,11 +1431,20 @@ while ($true) {
     Write-Banner "Results"
     $sorted | Format-Table Region, DisplayName, $quotaCol, SqlDb, Eligible -AutoSize | Out-Host
 
+    if (@($sorted | Where-Object Eligible -eq 'UNVERIFIED').Count -gt 0) {
+        Write-Host ("UNVERIFIED: Azure SQL is available, but the App Service {0} quota couldn't be read (no quota row, or the quota API errored). These regions can deploy but might fail, so they aren't recommended." -f $AppServiceSku) -ForegroundColor DarkGray
+        Write-Host ''
+    }
+
     $ineligible = @($sorted | Where-Object { $_.Eligible -eq 'no' })
     if ($ineligible.Count -gt 0) {
-        Write-Host "Why regions are not eligible (Azure SQL $SqlEdition/$SqlServiceObjective):" -ForegroundColor DarkYellow
+        Write-Host "Why regions are not eligible:" -ForegroundColor DarkYellow
         foreach ($r in $ineligible) {
-            Write-Host ("  {0,-22} {1}" -f $r.Region, $r.SqlReason) -ForegroundColor DarkYellow
+            $why = @(
+                if ($r.SqlDb -ne 'Yes') { "Azure SQL $SqlEdition/$SqlServiceObjective`: $($r.SqlReason)" }
+                if (-not $appSvcSlugs.Contains($r.Region)) { "App Service $AppServiceSku not offered" }
+            ) -join ' | '
+            Write-Host ("  {0,-22} {1}" -f $r.Region, $why) -ForegroundColor DarkYellow
         }
         Write-Host ''
     }
@@ -1427,7 +1456,7 @@ while ($true) {
 
     # An interactive deploy run carries on to the region picker even with nothing eligible (back, advanced, or quit)
     if ($eligible.Count -eq 0 -and ($CheckOnly -or $Force -or -not [Environment]::UserInteractive)) {
-        Write-Host "No region in this selection has Azure SQL $SqlEdition/$SqlServiceObjective available." -ForegroundColor Red
+        Write-Host "No region in this selection has both Azure SQL $SqlEdition/$SqlServiceObjective and App Service $AppServiceSku available." -ForegroundColor Red
         Write-Host "Exiting." -ForegroundColor Red
         Save-Report
         return
@@ -1446,8 +1475,10 @@ while ($true) {
             $script:report.policy.probe.blockingPolicyIds = @($probe.blockingPolicyIds)
         }
         Write-Host ''
-        $readyCount = @($eligible | Where-Object Eligible -eq 'YES').Count
-        Write-Host ("Check-only mode: {0} region(s) ready, {1} eligible after a quota increase. Stopping before deployment." -f $readyCount, ($eligible.Count - $readyCount)) -ForegroundColor Cyan
+        $readyCount      = @($eligible | Where-Object Eligible -eq 'YES').Count
+        $quotaCount      = @($eligible | Where-Object Eligible -eq 'QUOTA').Count
+        $unverifiedCount = @($eligible | Where-Object Eligible -eq 'UNVERIFIED').Count
+        Write-Host ("Check-only mode: {0} region(s) ready, {1} eligible after a quota increase, {2} unverified. Stopping before deployment." -f $readyCount, $quotaCount, $unverifiedCount) -ForegroundColor Cyan
         Write-Host "Re-run with -ResourceGroupName <name> (and without -CheckOnly) to deploy." -ForegroundColor DarkGray
         Save-Report
         return
@@ -1458,12 +1489,16 @@ while ($true) {
     # ====================================================================
     Write-Banner "Select a region for NMM deployment"
     if ($eligible.Count -eq 0) {
-        Write-Host "No region in this selection has Azure SQL $SqlEdition/$SqlServiceObjective available." -ForegroundColor Red
+        Write-Host "No region in this selection has both Azure SQL $SqlEdition/$SqlServiceObjective and App Service $AppServiceSku available." -ForegroundColor Red
+    } elseif ($recommended.Count -eq 0) {
+        Write-Host "No recommended region in this selection: none has confirmed App Service $AppServiceSku quota. The unverified regions below might fail." -ForegroundColor Yellow
     }
     for ($i = 0; $i -lt $eligible.Count; $i++) {
         $e = $eligible[$i]
         if ($e.Eligible -eq 'QUOTA') {
             Write-Host ("  {0,2}. {1}  ({2})  [needs {3} quota increase, currently {4} - requested automatically after you confirm]" -f ($i + 1), $e.DisplayName, $e.Region, $AppServiceSku, $e.$quotaCol) -ForegroundColor Yellow
+        } elseif ($e.Eligible -eq 'UNVERIFIED') {
+            Write-Host ("  {0,2}. {1}  ({2})  [unverified: {3} quota couldn't be checked - might fail]" -f ($i + 1), $e.DisplayName, $e.Region, $AppServiceSku) -ForegroundColor DarkYellow
         } else {
             Write-Host ("  {0,2}. {1}  ({2})" -f ($i + 1), $e.DisplayName, $e.Region)
         }
@@ -1473,7 +1508,8 @@ while ($true) {
     Write-Host "   0. << Back to geography / region selection" -ForegroundColor Cyan
     Write-Host "   Q. Quit" -ForegroundColor Cyan
 
-    $defaultPick = if ($eligible.Count -gt 0) { '1' } else { '0' }
+    # Default to the first recommended region (YES, then QUOTA); never default to an UNVERIFIED one
+    $defaultPick = if ($recommended.Count -gt 0) { '1' } else { '0' }
     $idx = -1
     $advanced = $false
     do {
@@ -1508,7 +1544,9 @@ while ($true) {
     $Location = $sel.Region
     $script:report.selectedRegion = $Location
     $script:report.advancedRegion = $advanced
-    $selNote = if ($advanced) { '  (advanced: eligibility checks skipped)' } else { '' }
+    $selNote = if ($advanced) { '  (advanced: eligibility checks skipped)' }
+               elseif ($sel.Eligible -eq 'UNVERIFIED') { '  (unverified: App Service quota not confirmed)' }
+               else { '' }
     Write-Host ("Selected: {0} ({1}){2}" -f $sel.DisplayName, $Location, $selNote) -ForegroundColor Green
 
     # Ground-truth policy probe (opt-in): create+delete representative resources in
@@ -1550,6 +1588,8 @@ while ($true) {
     Write-Host ("  Region         : {0} ({1})" -f $sel.DisplayName, $Location)
     if ($advanced) {
         Write-Host "                   advanced pick: eligibility checks skipped, quota and capacity not verified" -ForegroundColor DarkYellow
+    } elseif ($sel.Eligible -eq 'UNVERIFIED') {
+        Write-Host ("                   unverified: {0} quota couldn't be checked here, so the deployment might fail" -f $AppServiceSku) -ForegroundColor DarkYellow
     }
     Write-Host ("  App Service    : {0} x{1}    Azure SQL : {2}/{3}" -f $AppServiceSku, $AppServiceInstances, $SqlEdition, $SqlServiceObjective)
     if ($quotaPlan) {
