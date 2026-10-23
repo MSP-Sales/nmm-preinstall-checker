@@ -391,8 +391,8 @@ function Get-AppServiceQuotaStatus {
     if ($found['Total']) {
         $q = $found['Total']; $out.QuotaSource = $q.Label
         if (Test-Short $q) {
-            # The automatic increase raises the SKU row, which this region doesn't return, so it can't fix this
-            $out.Reason = "No '$Sku VMs' row, and $($q.Label) is $($q.Used) of $($q.Limit) used (need $Required free)"
+            # Only SKU rows can be increased; Total Regional VMs can't, and this region has no SKU row to raise
+            $out.Reason = "No '$Sku VMs' row, and $($q.Label) is $($q.Used) of $($q.Limit) used (need $Required free). Total Regional VMs quota can't be increased"
             return $out
         }
         $out.Ok = $true
@@ -1391,7 +1391,8 @@ while ($true) {
     # Eligibility, best first:
     #   YES         SQL ok, App Service SKU offered, quota with enough free: the SKU row ('B2 VMs') if the
     #               region returns one, otherwise the 'Total Regional VMs' row
-    #   QUOTA       SQL ok, SKU offered, SKU row too low (the automatic increase fixes it)
+    #   QUOTA       SQL ok, SKU offered, SKU row too low (the automatic increase fixes it; only SKU rows
+    #               can be increased, Total Regional VMs can't)
     #   UNVERIFIED  SQL ok, SKU offered, but quota couldn't be confirmed: no quota rows, Total Regional VMs
     #               full with no SKU row, or the quota API errored. Selectable but never recommended.
     #   no          SQL unavailable, or the SKU isn't offered in the region
@@ -1453,9 +1454,10 @@ while ($true) {
     Write-Banner "Results"
     $sorted | Format-Table Region, DisplayName, $quotaCol, TotalRegional, SqlDb, Eligible -AutoSize | Out-Host
     Write-Host ("App Service quota: the {0} VMs row ({1}) decides when the region returns one; otherwise Total Regional VMs (TotalRegional) does. '-' = row not returned." -f $AppServiceSku, $quotaCol) -ForegroundColor DarkGray
+    Write-Host ("Only {0} VMs quota can be increased (QUOTA regions get the increase automatically). Total Regional VMs quota can't be increased." -f $AppServiceSku) -ForegroundColor DarkGray
 
     if (@($sorted | Where-Object Eligible -eq 'UNVERIFIED').Count -gt 0) {
-        Write-Host ("UNVERIFIED: Azure SQL is available, but App Service quota couldn't be confirmed (no {0} VMs or Total Regional VMs row, Total Regional VMs full with no {0} VMs row, or the quota API errored). These regions might fail, so they aren't recommended." -f $AppServiceSku) -ForegroundColor DarkGray
+        Write-Host ("UNVERIFIED: Azure SQL is available, but App Service quota couldn't be confirmed (no {0} VMs or Total Regional VMs row, Total Regional VMs full with no {0} VMs row to increase, or the quota API errored). These regions might fail, so they aren't recommended." -f $AppServiceSku) -ForegroundColor DarkGray
     }
     Write-Host ''
 

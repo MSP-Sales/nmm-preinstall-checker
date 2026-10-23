@@ -102,7 +102,7 @@ Surfaces which regions offer **both** resources the NMM deployment needs:
 - App Service Plan: Basic Medium (**B2**), Windows
 - Azure SQL Database: **Standard / S1** (20 DTU)
 
-The installer also reads the subscription's **App Service quota** per region through the `Microsoft.Quota` API needing `-AppServiceInstances` free. The `B2 VMs` row decides when the region returns one. Many regions don't return a `B2 VMs` row, only *Total Regional VMs* (e.g. Austria East: 0 of 31); there the regional limit applies, and deploying within it works. The results table shows both rows (`B2Quota` and `TotalRegional`; `-` means the row wasn't returned).
+The installer also reads the subscription's **App Service quota** per region through the `Microsoft.Quota` API needing `-AppServiceInstances` free. The `B2 VMs` row decides when the region returns one. Many regions don't return a `B2 VMs` row, only *Total Regional VMs* (e.g. Austria East: 0 of 31); there the regional limit applies, and deploying within it works. The results table shows both rows (`B2Quota` and `TotalRegional`; `-` means the row wasn't returned). **Only `B2 VMs` quota can be increased** (that's what the automatic increase does for QUOTA regions). *Total Regional VMs* quota can't be increased, so a region with no `B2 VMs` row and a full *Total Regional VMs* row is UNVERIFIED.
 
 Each region gets one of four statuses, best first:
 
