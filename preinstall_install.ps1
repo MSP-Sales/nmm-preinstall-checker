@@ -14,7 +14,7 @@ param(
     [switch]$PolicyProbe,
     [switch]$RegisterProviders,
     [int]$ProviderTimeoutMinutes = 15,
-    [string]$NmmVersion          = '6.8.0',
+    [string]$NmmVersion,         # pin the post-install NMM release; default is the latest (template stays 6.8.0)
     [switch]$CheckOnly,
     [switch]$Force
 )
@@ -27,7 +27,6 @@ $ErrorActionPreference = 'Continue'
 # ====================================================================
 $script:report = [ordered]@{
     timestamp        = (Get-Date -Format 'o')
-    nmmVersion       = $NmmVersion
     checkOnly        = [bool]$CheckOnly
     subscriptionId   = $null
     subscriptionName = $null
@@ -41,12 +40,13 @@ $script:report = [ordered]@{
     providers        = @()
     regions          = @()
     selectedRegion   = $null
+    advancedRegion   = $false   # region picked with the advanced option (eligibility checks skipped)
     quotaRequest     = [ordered]@{ requested = $false; sku = $null; region = $null; fromLimit = $null; toLimit = $null; ok = $null; message = $null }
     policy           = [ordered]@{
         denyAssignments = @()
         probe           = [ordered]@{ ran = $false; blocked = $null; blockingPolicyIds = @() }
     }
-    deployment       = [ordered]@{ name = $null; provisioningState = $null; webAppUrl = $null }
+    deployment       = [ordered]@{ name = $null; provisioningState = $null; webAppUrl = $null; marketplaceTerms = $null; nmmVersion = $null }   # marketplaceTerms: method that accepted, or 'failed'; nmmVersion: release used for post-install
 }
 
 function Save-Report {
@@ -78,6 +78,10 @@ if (-not $CheckOnly -and [string]::IsNullOrWhiteSpace($ResourceGroupName)) {
     throw "ResourceGroupName is required to deploy. Pass -ResourceGroupName <name>, or run with -CheckOnly to only run the readiness checks."
 }
 if ($AppServiceInstances -lt 1) { $AppServiceInstances = 1 }
+if ($NmmVersion -and -not ($NmmVersion -as [version])) {
+    throw "-NmmVersion '$NmmVersion' isn't a version number (e.g. 7.3.3). Leave it out to use the latest NMM release."
+}
+$nmmLabel = if ($NmmVersion) { "$NmmVersion (pinned with -NmmVersion)" } else { 'latest release' }
 
 $NmmRequiredProviders = @(
     'Microsoft.KeyVault','Microsoft.Compute','Microsoft.Automation','Microsoft.Storage',
@@ -96,10 +100,11 @@ $DeployWindowMins  = 75    # an NMM deploy + post-install takes ~45-60 min; warn
 # ====================================================================
 # Embedded so the script is a single self-contained file -- works with a
 # Cloud Shell curl-pipe / one-liner and from any working directory (no
-# companion template.json to ship). 'packageVersion' is a template parameter
-# fed from -NmmVersion at deploy time, so the version stays single-sourced and
-# cannot drift. Single-quoted here-string: no PowerShell interpolation of the
-# ARM '$schema' / "[...]" expressions.
+# companion template.json to ship). The plan version (6.8.0) is the Azure
+# Marketplace template version, which doesn't track NMM releases, so it's fixed
+# here. The Phase 5 post-install configuration uses the latest NMM release.
+# Single-quoted here-string: no PowerShell interpolation of the ARM '$schema' /
+# "[...]" expressions.
 $nmmTemplateJson = @'
 {
     "$schema": "https://schema.management.azure.com/schemas/2015-01-01/deploymentTemplate.json#",
@@ -123,13 +128,6 @@ $nmmTemplateJson = @'
         "applicationResourceName": {
             "type": "string",
             "defaultValue": "nerdioMspApp"
-        },
-        "packageVersion": {
-            "type": "string",
-            "defaultValue": "6.8.0",
-            "metadata": {
-                "description": "NMM marketplace package version to deploy. Fed from the script's -NmmVersion parameter so the install and the post-install configuration script target the same version."
-            }
         }
     },
     "variables": {},
@@ -144,7 +142,7 @@ $nmmTemplateJson = @'
                 "name": "nmm-plan",
                 "product": "nmm",
                 "publisher": "nerdio",
-                "version": "[parameters('packageVersion')]"
+                "version": "6.8.0"
             },
             "properties": {
                 "managedResourceGroupId": "[concat(subscription().id,'/resourceGroups/',take(concat(resourceGroup().name,'-',uniquestring(resourceGroup().id),uniquestring(parameters('applicationResourceName'))),90))]",
@@ -304,6 +302,7 @@ function Get-AppServiceQuotaStatus {
         SkuUsed = $null; SkuLimit = $null; TotalUsed = $null; TotalLimit = $null
         SkuRowName = ''; SkuRowCount = 0
         NeedsQuota = $false   # quota row exists but limit is too low -> fixable with a quota increase
+        QuotaSource = ''      # the row that decided: '<Sku> VMs' or 'Total Regional VMs'
     }
 
     # Follows nextLink so large result sets aren't truncated
@@ -329,7 +328,7 @@ function Get-AppServiceQuotaStatus {
         $usages = Get-All "$scope/usages?api-version=$ApiVersion"
     } catch {
         $code = $null
-        try { $code = ($_.ErrorDetails.Message | ConvertFrom-Json).error.code } catch {}
+        if ($_.ErrorDetails.Message) { try { $code = ($_.ErrorDetails.Message | ConvertFrom-Json).error.code } catch {} }
         $msg = if ($code) { "$code - $($_.Exception.Message)" } else { $_.Exception.Message }
         $out.Reason = "Quota API error: $msg"
         return $out
@@ -340,24 +339,22 @@ function Get-AppServiceQuotaStatus {
         return $out
     }
 
+    # Two rows matter. The SKU row ('B2 VMs') is the specific one and decides whenever the region returns it
+    # (e.g. germanywestcentral B2 0 of 0 -> QUOTA). Many regions return no SKU row, only 'Total Regional VMs'
+    # (e.g. austriaeast: Total 0 of 31); there the regional limit is what applies, and deploying within it works.
     $checks = @(
         @{ Key = 'Sku';   Label = "$Sku VMs";           Pattern = "^$([regex]::Escape($Sku))(\s*VMs)?$" },
         @{ Key = 'Total'; Label = 'Total Regional VMs'; Pattern = 'Total\s*Regional' }
     )
 
+    $found = @{}
     foreach ($chk in $checks) {
         $qHits = Find-Rows $quotas $chk.Pattern
         if ($chk.Key -eq 'Sku') {
             $out.SkuRowCount = $qHits.Count
             $out.SkuRowName  = (@($qHits | ForEach-Object { $_.properties.name.value }) -join ',')
         }
-        if ($qHits.Count -eq 0) {
-            # Total Regional VMs is informational; a missing row is not a blocker
-            if ($chk.Key -eq 'Total') { continue }
-            # Total Regional VMs can be listed while the SKU row is missing -> effective SKU limit is 0
-            $out.Reason = "No '$($chk.Label)' quota row in this subscription/region (effective limit 0; request via support)"
-            return $out
-        }
+        if ($qHits.Count -eq 0) { continue }
 
         # Fail closed: a missing limit counts as 0, and with several matching rows use the smallest limit
         $limits = @($qHits | ForEach-Object {
@@ -375,20 +372,33 @@ function Get-AppServiceQuotaStatus {
 
         if ($chk.Key -eq 'Sku') { $out.SkuUsed = $used;   $out.SkuLimit = $limit }
         else                    { $out.TotalUsed = $used; $out.TotalLimit = $limit }
+        $found[$chk.Key] = [pscustomobject]@{ Label = $chk.Label; Used = $used; Limit = $limit }
+    }
 
-        # Total Regional VMs is informational: Azure shows it as 0/0 in regions where it isn't populated
-        # (e.g. West US with B2 0/31), and it rises automatically when SKU quota is granted. Only treat it
-        # as a blocker when it has a real limit that is exhausted; raising the SKU quota fixes that case too.
-        if ($chk.Key -eq 'Total' -and $limit -eq 0) { continue }
+    function Test-Short($q) { $q.Limit -lt $Required -or ($q.Limit - $q.Used) -lt $Required }
 
-        if ($limit -lt $Required -or ($limit - $used) -lt $Required) {
-            $out.Reason     = "$($chk.Label): $used of $limit used, need $Required free (quota increase needed)"
+    if ($found['Sku']) {
+        # When the SKU row exists, Total Regional VMs is informational: it shows 0/0 where it isn't populated
+        $q = $found['Sku']; $out.QuotaSource = $q.Label
+        if (Test-Short $q) {
+            $out.Reason     = "$($q.Label): $($q.Used) of $($q.Limit) used, need $Required free (quota increase needed)"
             $out.NeedsQuota = $true
             return $out
         }
+        $out.Ok = $true
+        return $out
     }
-
-    $out.Ok = $true
+    if ($found['Total']) {
+        $q = $found['Total']; $out.QuotaSource = $q.Label
+        if (Test-Short $q) {
+            # Only SKU rows can be increased; Total Regional VMs can't, and this region has no SKU row to raise
+            $out.Reason = "No '$Sku VMs' row, and $($q.Label) is $($q.Used) of $($q.Limit) used (need $Required free). Total Regional VMs quota can't be increased"
+            return $out
+        }
+        $out.Ok = $true
+        return $out
+    }
+    $out.Reason = "No '$Sku VMs' or 'Total Regional VMs' quota row returned for this subscription/region"
     return $out
 }
 
@@ -522,6 +532,37 @@ function Show-GeographyPrompt {
         $idx = 1
     }
     return $geoMenu[$labels[$idx - 1]]
+}
+
+function Select-AnyRegion {
+    # Advanced option: deploy to any Azure region, skipping the eligibility checks.
+    # Returns a region row for the deploy confirmation, or $null if the user goes back.
+    param($CheckResults)
+    Write-Host ''
+    Write-Host "Advanced: the eligibility checks are skipped. If the region lacks quota or capacity, the deployment will fail and you'll need to fix that yourself." -ForegroundColor DarkYellow
+    while ($true) {
+        $typed = Read-Host "Enter any Azure region name (e.g. eastus, westeurope), or B to go back"
+        if ([string]::IsNullOrWhiteSpace($typed)) { continue }
+        if ($typed -match '^\s*[Bb]\s*$') { return $null }
+        $region = ($typed -replace '\s', '').ToLower()
+        if ($slugToName.ContainsKey($region)) { break }
+        Write-Host ("'{0}' isn't an Azure region. Valid names: {1}" -f $typed.Trim(), (($slugToName.Keys | Sort-Object) -join ', ')) -ForegroundColor Yellow
+    }
+    # Plain loop on purpose: @() around the results List throws "Argument types do not match" in PowerShell 7.4
+    $known = $null
+    foreach ($r in $CheckResults) { if ($r.Region -eq $region) { $known = $r; break } }
+    if (-not $known) {
+        Write-Host "  $region wasn't included in the checks above." -ForegroundColor DarkGray
+    } elseif ($known.SqlDb -ne 'Yes') {
+        Write-Warning ("Azure SQL check for {0}: {1}" -f $region, $known.SqlReason)
+    } elseif ($known.Eligible -eq 'no') {
+        Write-Warning ("App Service {0} isn't offered in {1}." -f $AppServiceSku, $region)
+    } elseif ($known.Eligible -eq 'QUOTA') {
+        Write-Warning ("App Service quota in {0}: {1}. The advanced option doesn't request the increase." -f $region, $known.AppServiceReason)
+    } elseif ($known.Eligible -eq 'UNVERIFIED') {
+        Write-Warning ("App Service {0} quota for {1} couldn't be verified: {2}" -f $AppServiceSku, $region, $known.AppServiceReason)
+    }
+    return [pscustomobject]@{ Region = $region; DisplayName = $slugToName[$region]; Eligible = 'ADVANCED' }
 }
 
 # ====================================================================
@@ -846,12 +887,36 @@ if ($needAz) {
     }
 }
 
+# Azure CLI in Cloud Shell builds its subscription list once, when the session signs in.
+# 'az account list --refresh' can't re-list there (no user token cache) and silently returns
+# that snapshot, so a subscription created after Cloud Shell started never shows up.
+# 'az login --identity' re-runs the Cloud Shell sign-in (home tenant), which picks it up.
+$prevSub = az account show --query id -o tsv --only-show-errors 2>$null
+az login --identity --only-show-errors -o none 2>$null
+if ($prevSub) { az account set --subscription $prevSub --only-show-errors 2>$null }
+
 # Subscription selection: honor -SubscriptionId, else auto-pick a lone enabled
-# sub, else prompt. --refresh pulls the live list instead of the CLI cache;
-# --all includes non-Enabled subs so they're visible (but not selectable).
+# sub, else prompt. --all includes non-Enabled subs so they're visible (but not selectable).
 if (-not $SubscriptionId) {
-    $allSubs     = @(az account list --refresh --all --only-show-errors 2>$null | ConvertFrom-Json)
+    $allSubs     = @(az account list --all --only-show-errors 2>$null | ConvertFrom-Json)
     $enabledSubs = @($allSubs | Where-Object { $_.state -eq 'Enabled' })
+
+    # Subscriptions Az PowerShell can see but Azure CLI still can't (typically another tenant)
+    # can't be used by the Azure CLI checks; list them so they don't silently go missing.
+    if (Get-Command Get-AzSubscription -ErrorAction SilentlyContinue) {
+        $cliIds = @($allSubs | ForEach-Object { $_.id })
+        $psOnly = @(Get-AzSubscription -ErrorAction SilentlyContinue -WarningAction SilentlyContinue |
+            Where-Object { $_.Id -notin $cliIds })
+        if ($psOnly.Count -gt 0) {
+            Write-Host ''
+            Write-Host "Subscription(s) visible to Az PowerShell but not to Azure CLI in this session (can't be used yet):" -ForegroundColor Yellow
+            foreach ($s in $psOnly) {
+                Write-Host ("  - {0}  [{1}]  tenant {2}" -f $s.Name, $s.Id, $s.TenantId) -ForegroundColor Yellow
+            }
+            Write-Host "  To use one: run 'az login --tenant <tenant>' in Cloud Shell (or restart Cloud Shell), then re-run this script." -ForegroundColor Yellow
+        }
+    }
+
     if ($enabledSubs.Count -eq 0) {
         throw "No enabled Azure subscriptions found for this account."
     }
@@ -897,7 +962,7 @@ az account set --subscription $SubscriptionId --only-show-errors | Out-Null
 $ctx = az account show --only-show-errors 2>$null | ConvertFrom-Json
 if (-not $ctx) { throw "Not logged in. Run 'az login' first." }
 if ($ctx.id -ne $SubscriptionId -and $ctx.name -ne $SubscriptionId) {
-    throw "Azure CLI couldn't switch to subscription '$SubscriptionId' (still on '$($ctx.name)')."
+    throw "Azure CLI couldn't switch to subscription '$SubscriptionId' (still on '$($ctx.name)'). If it's in another tenant, run 'az login --tenant <tenantId>' first."
 }
 $subId = $ctx.id
 $script:report.subscriptionId   = $ctx.id
@@ -927,8 +992,8 @@ if (-not $token) { throw "Could not acquire Azure access token." }
 Write-Banner "Nerdio Manager for MSP (NMM) - Pre-Install Readiness Check"
 Write-Host ("Subscription : {0}" -f $ctx.name)
 Write-Host ("Sub ID       : {0}" -f $ctx.id)
-Write-Host ("NMM version  : {0}" -f $NmmVersion)
 Write-Host ("Checking for : App Service '{0}' x{1} (quota)  +  Azure SQL '{2}/{3}'" -f $AppServiceSku, $AppServiceInstances, $SqlEdition, $SqlServiceObjective)
+Write-Host ("NMM version  : {0}, installed by the post-install step (Marketplace template: 6.8.0)" -f $nmmLabel)
 if ($CheckOnly) { Write-Host "Mode         : check only (no changes to the subscription)" -ForegroundColor DarkGray }
 if ($Force)     { Write-Host "-Force       : readiness gates will be bypassed." -ForegroundColor DarkYellow }
 Write-Host ''
@@ -1285,11 +1350,14 @@ while ($true) {
 
     if (-not $candidates -or @($candidates).Count -eq 0) {
         Write-Host "No candidate regions to check." -ForegroundColor Yellow
-        if ([Environment]::UserInteractive -and (Read-YesNo -Prompt "Go back and choose a different geography?" -DefaultYes $true) -and -not $Force) {
-            $Regions = $null; $Geography = $null; continue
+        if ($CheckOnly -or $Force -or -not [Environment]::UserInteractive) {
+            if ([Environment]::UserInteractive -and (Read-YesNo -Prompt "Go back and choose a different geography?" -DefaultYes $true) -and -not $Force) {
+                $Regions = $null; $Geography = $null; continue
+            }
+            Save-Report
+            return
         }
-        Save-Report
-        return
+        # A deploy run carries on to the region picker, which offers going back, the advanced any-region option, or quitting
     }
     $candidates = @($candidates)
 
@@ -1317,9 +1385,17 @@ while ($true) {
     $appQuotaResults = @($checkResults | ForEach-Object { $_.App } | Where-Object { $_ })
     if ($appQuotaResults.Count -gt 0 -and
         @($appQuotaResults | Where-Object { $_.Reason -like 'Quota API error*' }).Count -eq $appQuotaResults.Count) {
-        Write-Warning "App Service quota API failed in every region; quota could not be verified. First error: $($appQuotaResults[0].Reason)"
+        Write-Warning "App Service quota API failed in every region, so every region shows as UNVERIFIED. First error: $($appQuotaResults[0].Reason)"
     }
 
+    # Eligibility, best first:
+    #   YES         SQL ok, App Service SKU offered, quota with enough free: the SKU row ('B2 VMs') if the
+    #               region returns one, otherwise the 'Total Regional VMs' row
+    #   QUOTA       SQL ok, SKU offered, SKU row too low (the automatic increase fixes it; only SKU rows
+    #               can be increased, Total Regional VMs can't)
+    #   UNVERIFIED  SQL ok, SKU offered, but quota couldn't be confirmed: no quota rows, Total Regional VMs
+    #               full with no SKU row, or the quota API errored. Selectable but never recommended.
+    #   no          SQL unavailable, or the SKU isn't offered in the region
     $results = New-Object System.Collections.Generic.List[object]
     foreach ($slug in $candidates) {
         $offered   = $appSvcSlugs.Contains($slug)
@@ -1329,8 +1405,7 @@ while ($true) {
         $sql       = $sqlByRegion[$slug]
         $sqlOk     = ($null -ne $sql) -and ($sql.Ok -eq $true)
         $display   = if ($slugToName.ContainsKey($slug)) { $slugToName[$slug] } else { $slug }
-        $appReason = if ($appOk) { '' }
-                     elseif (-not $offered) { "App Service $AppServiceSku not offered" }
+        $appReason = if (-not $offered) { "App Service $AppServiceSku not offered" }
                      elseif ($app) { $app.Reason }
                      else { 'no App Service quota result' }
         $skuQuota   = '-'
@@ -1343,19 +1418,21 @@ while ($true) {
             AppService       = if ($appOk) { 'Yes' } elseif ($appQuota) { 'Quota' } else { 'No' }
             $quotaCol        = $skuQuota
             SqlDb            = if ($sqlOk) { 'Yes' } else { 'No' }
-            Eligible         = if ($appOk -and $sqlOk) { 'YES' } elseif ($appQuota -and $sqlOk) { 'QUOTA' } else { 'no' }
+            Eligible         = if (-not $sqlOk -or -not $offered) { 'no' } elseif ($appOk) { 'YES' } elseif ($appQuota) { 'QUOTA' } else { 'UNVERIFIED' }
             SqlReason        = if ($sqlOk) { '' } else { if ($sql) { $sql.Reason } else { 'no SQL result' } }
             AppServiceReason = $appReason
             SkuRowName       = if ($app) { $app.SkuRowName } else { '' }
             SkuRowCount      = if ($app) { $app.SkuRowCount } else { 0 }
             TotalRegional    = $totalQuota
+            QuotaSource      = if ($app) { $app.QuotaSource } else { '' }
         })
     }
 
-    $eligRank = @{ 'YES' = 0; 'QUOTA' = 1; 'no' = 2 }
+    $eligRank = @{ 'YES' = 0; 'QUOTA' = 1; 'UNVERIFIED' = 2; 'no' = 3 }
     $sorted   = @($results | Sort-Object @{E={ $eligRank[$_.Eligible] }}, DisplayName)
-    # Regions that only need a quota increase are still offered in the picker, with a warning
-    $eligible = @($sorted | Where-Object { $_.Eligible -eq 'YES' -or $_.Eligible -eq 'QUOTA' })
+    # The picker offers YES, QUOTA and UNVERIFIED regions (in that order); only YES and QUOTA are recommended
+    $eligible    = @($sorted | Where-Object { $_.Eligible -in 'YES', 'QUOTA', 'UNVERIFIED' })
+    $recommended = @($eligible | Where-Object { $_.Eligible -in 'YES', 'QUOTA' })
 
     $script:report.regions = @($sorted | ForEach-Object {
         [ordered]@{
@@ -1364,34 +1441,34 @@ while ($true) {
             status              = $_.Eligible
             eligible            = ($_.Eligible -eq 'YES')
             quotaIncreaseNeeded = ($_.Eligible -eq 'QUOTA')
+            quotaUnverified     = ($_.Eligible -eq 'UNVERIFIED')
             appService          = $_.AppService
             appServiceQuota     = $_.$quotaCol
             totalRegionalQuota  = $_.TotalRegional
+            quotaSource         = $_.QuotaSource
             sqlDb               = ($_.SqlDb -eq 'Yes')
             reasons             = @($_.SqlReason, $_.AppServiceReason | Where-Object { $_ })
         }
     })
 
     Write-Banner "Results"
-    $sorted | Format-Table Region, DisplayName, AppService, $quotaCol, SqlDb, Eligible -AutoSize | Out-Host
+    $sorted | Format-Table Region, DisplayName, $quotaCol, TotalRegional, SqlDb, Eligible -AutoSize | Out-Host
+    Write-Host ("App Service quota: a region with free quota in {0} or TotalRegional is a good choice (when a region has a {0} row, that row is the one that counts)." -f $quotaCol) -ForegroundColor Gray
+    Write-Host ("QUOTA means the {0} row is full; the script raises it for you. TotalRegional can't be increased. '-' means Azure didn't return that row." -f $quotaCol) -ForegroundColor Gray
 
-    $needQuota = @($sorted | Where-Object { $_.Eligible -eq 'QUOTA' })
-    if ($needQuota.Count -gt 0) {
-        Write-Host "Eligible after a quota increase (SKU quota row exists but limit is too low):" -ForegroundColor Yellow
-        foreach ($r in $needQuota) {
-            Write-Host ("  {0,-22} {1}" -f $r.Region, $r.AppServiceReason) -ForegroundColor Yellow
-        }
-        if ($CheckOnly) {
-            Write-Host "  A deploy run offers to request this increase automatically after you confirm." -ForegroundColor DarkGray
-        }
-        Write-Host ''
+    if (@($sorted | Where-Object Eligible -eq 'UNVERIFIED').Count -gt 0) {
+        Write-Host ("UNVERIFIED: Azure SQL is available, but App Service quota couldn't be confirmed (no {0} or TotalRegional row, TotalRegional full with no {0} row to increase, or the quota API errored). These regions might fail, so they aren't recommended." -f $quotaCol) -ForegroundColor Gray
     }
+    Write-Host ''
 
     $ineligible = @($sorted | Where-Object { $_.Eligible -eq 'no' })
     if ($ineligible.Count -gt 0) {
         Write-Host "Why regions are not eligible:" -ForegroundColor DarkYellow
         foreach ($r in $ineligible) {
-            $why = @($r.AppServiceReason, $r.SqlReason | Where-Object { $_ }) -join ' | '
+            $why = @(
+                if ($r.SqlDb -ne 'Yes') { "Azure SQL $SqlEdition/$SqlServiceObjective`: $($r.SqlReason)" }
+                if (-not $appSvcSlugs.Contains($r.Region)) { "App Service $AppServiceSku not offered" }
+            ) -join ' | '
             Write-Host ("  {0,-22} {1}" -f $r.Region, $why) -ForegroundColor DarkYellow
         }
         Write-Host ''
@@ -1402,12 +1479,9 @@ while ($true) {
         Write-Host ("Results CSV: {0}" -f $OutFile) -ForegroundColor Cyan
     }
 
-    if ($eligible.Count -eq 0) {
-        Write-Host "No region has App Service $AppServiceSku (available or requestable) and SQL $SqlEdition/$SqlServiceObjective available." -ForegroundColor Red
-        if (-not $CheckOnly -and -not $Force -and [Environment]::UserInteractive -and
-            (Read-YesNo -Prompt "Go back and choose a different geography?" -DefaultYes $true)) {
-            $Regions = $null; $Geography = $null; continue
-        }
+    # An interactive deploy run carries on to the region picker even with nothing eligible (back, advanced, or quit)
+    if ($eligible.Count -eq 0 -and ($CheckOnly -or $Force -or -not [Environment]::UserInteractive)) {
+        Write-Host "No region in this selection has both Azure SQL $SqlEdition/$SqlServiceObjective and App Service $AppServiceSku available." -ForegroundColor Red
         Write-Host "Exiting." -ForegroundColor Red
         Save-Report
         return
@@ -1426,8 +1500,10 @@ while ($true) {
             $script:report.policy.probe.blockingPolicyIds = @($probe.blockingPolicyIds)
         }
         Write-Host ''
-        $readyCount = @($eligible | Where-Object Eligible -eq 'YES').Count
-        Write-Host ("Check-only mode: {0} region(s) ready, {1} eligible after a quota increase. Stopping before deployment." -f $readyCount, ($eligible.Count - $readyCount)) -ForegroundColor Cyan
+        $readyCount      = @($eligible | Where-Object Eligible -eq 'YES').Count
+        $quotaCount      = @($eligible | Where-Object Eligible -eq 'QUOTA').Count
+        $unverifiedCount = @($eligible | Where-Object Eligible -eq 'UNVERIFIED').Count
+        Write-Host ("Check-only mode: {0} region(s) ready, {1} eligible after a quota increase, {2} unverified. Stopping before deployment." -f $readyCount, $quotaCount, $unverifiedCount) -ForegroundColor Cyan
         Write-Host "Re-run with -ResourceGroupName <name> (and without -CheckOnly) to deploy." -ForegroundColor DarkGray
         Save-Report
         return
@@ -1437,37 +1513,66 @@ while ($true) {
     #  Phase 3: Region picker
     # ====================================================================
     Write-Banner "Select a region for NMM deployment"
+    if ($eligible.Count -eq 0) {
+        Write-Host "No region in this selection has both Azure SQL $SqlEdition/$SqlServiceObjective and App Service $AppServiceSku available." -ForegroundColor Red
+    } elseif ($recommended.Count -eq 0) {
+        Write-Host "No recommended region in this selection: none has confirmed App Service quota. The unverified regions below might fail." -ForegroundColor Yellow
+    }
     for ($i = 0; $i -lt $eligible.Count; $i++) {
         $e = $eligible[$i]
         if ($e.Eligible -eq 'QUOTA') {
             Write-Host ("  {0,2}. {1}  ({2})  [needs {3} quota increase, currently {4} - requested automatically after you confirm]" -f ($i + 1), $e.DisplayName, $e.Region, $AppServiceSku, $e.$quotaCol) -ForegroundColor Yellow
+        } elseif ($e.Eligible -eq 'UNVERIFIED') {
+            Write-Host ("  {0,2}. {1}  ({2})  [unverified: App Service quota couldn't be confirmed - might fail]" -f ($i + 1), $e.DisplayName, $e.Region) -ForegroundColor DarkYellow
         } else {
             Write-Host ("  {0,2}. {1}  ({2})" -f ($i + 1), $e.DisplayName, $e.Region)
         }
     }
     Write-Host ''
+    Write-Host "   A. Advanced: deploy to any region (skips these checks; you handle quota yourself)" -ForegroundColor DarkYellow
     Write-Host "   0. << Back to geography / region selection" -ForegroundColor Cyan
+    Write-Host "   Q. Quit" -ForegroundColor Cyan
 
+    # Default to the first recommended region (YES, then QUOTA); never default to an UNVERIFIED one
+    $defaultPick = if ($recommended.Count -gt 0) { '1' } else { '0' }
     $idx = -1
+    $advanced = $false
     do {
-        $pick = Read-Host "`nEnter choice [1]"
-        if ([string]::IsNullOrWhiteSpace($pick)) { $pick = '1' }
+        $pick = Read-Host "`nEnter choice [$defaultPick]"
+        if ([string]::IsNullOrWhiteSpace($pick)) { $pick = $defaultPick }
+        if ($pick -match '^[Qq]') {
+            Write-Host "Exiting without deploying." -ForegroundColor Yellow
+            Save-Report
+            return
+        }
+        if ($pick -match '^[Aa]') { $advanced = $true; break }
         if ($pick -match '^[Bb]') { $pick = '0' }
         if (-not [int]::TryParse($pick, [ref]$idx) -or $idx -lt 0 -or $idx -gt $eligible.Count) {
-            Write-Host ("Invalid choice. Enter 0-{0}." -f $eligible.Count) -ForegroundColor Yellow
+            Write-Host ("Invalid choice. Enter a number 0-{0}, A or Q." -f $eligible.Count) -ForegroundColor Yellow
             $idx = -1
         }
     } while ($idx -lt 0)
 
-    if ($idx -eq 0) {
+    if ($advanced) {
+        $sel = Select-AnyRegion -CheckResults $results
+        if (-not $sel) {
+            $Regions = $null; $Geography = $null
+            continue
+        }
+    } elseif ($idx -eq 0) {
         Write-Host "Returning to geography selection..." -ForegroundColor Cyan
         $Regions = $null; $Geography = $null
         continue
+    } else {
+        $sel = $eligible[$idx - 1]
     }
-    $sel      = $eligible[$idx - 1]
     $Location = $sel.Region
     $script:report.selectedRegion = $Location
-    Write-Host ("Selected: {0} ({1})" -f $sel.DisplayName, $Location) -ForegroundColor Green
+    $script:report.advancedRegion = $advanced
+    $selNote = if ($advanced) { '  (advanced: eligibility checks skipped)' }
+               elseif ($sel.Eligible -eq 'UNVERIFIED') { '  (unverified: App Service quota not confirmed)' }
+               else { '' }
+    Write-Host ("Selected: {0} ({1}){2}" -f $sel.DisplayName, $Location, $selNote) -ForegroundColor Green
 
     # Ground-truth policy probe (opt-in): create+delete representative resources in
     # the chosen region to confirm no policy blocks the install. Runs before the
@@ -1506,7 +1611,12 @@ while ($true) {
     Write-Host "About to deploy NMM:" -ForegroundColor Yellow
     Write-Host ("  Resource group : {0} (new)" -f $ResourceGroupName)
     Write-Host ("  Region         : {0} ({1})" -f $sel.DisplayName, $Location)
-    Write-Host ("  NMM version    : {0}" -f $NmmVersion)
+    if ($advanced) {
+        Write-Host "                   advanced pick: eligibility checks skipped, quota and capacity not verified" -ForegroundColor DarkYellow
+    } elseif ($sel.Eligible -eq 'UNVERIFIED') {
+        Write-Host "                   unverified: App Service quota couldn't be confirmed here, so the deployment might fail" -ForegroundColor DarkYellow
+    }
+    Write-Host ("  NMM version    : {0}, installed by the post-install step (Marketplace template: 6.8.0)" -f $nmmLabel)
     Write-Host ("  App Service    : {0} x{1}    Azure SQL : {2}/{3}" -f $AppServiceSku, $AppServiceInstances, $SqlEdition, $SqlServiceObjective)
     if ($quotaPlan) {
         Write-Host ("  Quota request  : raise {0} quota in {1} from {2} to {3} (currently {4} used) -- submitted first" -f $AppServiceSku, $Location, $quotaPlan.Current, $quotaPlan.New, $quotaPlan.Used) -ForegroundColor Yellow
@@ -1535,7 +1645,7 @@ while ($true) {
             if ($qr.Message) { Write-Host ("  Note: {0}" -f $qr.Message) -ForegroundColor Yellow }
         } else {
             Write-Host ("  Quota increase failed: {0}" -f $qr.Message) -ForegroundColor Red
-            Write-Host ("  Manual option: Portal > Quotas > App Service > Region '{0}' > {1} VMs > pencil icon, or open a free 'Service and subscription limits (quotas)' support request." -f $sel.DisplayName, $AppServiceSku) -ForegroundColor Yellow
+            Write-Host ("  Manual option: Portal > Quotas > App Service > Region '{0}' > {1} VMs > pencil icon." -f $sel.DisplayName, $AppServiceSku) -ForegroundColor Yellow
             if (-not $Force) {
                 $go = Read-Host "Continue with deployment anyway? (it will likely fail) [y/N, B = back to region selection]"
                 if ($go -match '^[Bb]') { $Regions = $null; $Geography = $null; continue }
@@ -1566,13 +1676,51 @@ try {
 
 # Accept the marketplace agreement for the managed application plan. Without
 # this the deployment can fail with MarketplacePurchaseEligibilityFailed.
-# (Managed app -> 'az term accept', not 'az vm image terms accept'.)
+# Both commands below call the same Marketplace Ordering API. 'az vm image terms' is
+# built into Azure CLI (not limited to VM images; tested against that failure), and
+# 'az term' comes from the marketplaceordering extension. Try the built-in one first,
+# fall back to the extension, and confirm the agreement with 'terms show'.
 Write-Host "Accepting Azure Marketplace terms for nerdio/nmm/nmm-plan..." -ForegroundColor Cyan
-$termsOutput = az term accept --publisher nerdio --product nmm --plan nmm-plan --only-show-errors 2>&1
-if ($LASTEXITCODE -eq 0) {
-    Write-Host "Marketplace terms accepted." -ForegroundColor Green
-} else {
-    Write-Warning ("Could not accept marketplace terms: {0}" -f ($termsOutput -join ' '))
+function Test-NmmTermsAccepted {
+    # $true / $false from the agreement, or $null if it couldn't be read
+    $v = az vm image terms show --publisher nerdio --offer nmm --plan nmm-plan --query accepted -o tsv --only-show-errors 2>$null
+    if ($LASTEXITCODE -ne 0 -or -not $v) { return $null }
+    return ("$v".Trim() -eq 'true')
+}
+$termsMethods = @(
+    @{ Name = 'az vm image terms accept'; Run = {
+        az vm image terms accept --publisher nerdio --offer nmm --plan nmm-plan --only-show-errors -o none 2>&1
+    } }
+    @{ Name = 'az term accept'; Run = {
+        # The extension installs on first use. In a terminal Azure CLI asks first, and that prompt would be
+        # hidden behind the captured output, so allow the install without a prompt for this call only.
+        $prevDyn = $env:AZURE_EXTENSION_USE_DYNAMIC_INSTALL
+        $env:AZURE_EXTENSION_USE_DYNAMIC_INSTALL = 'yes_without_prompt'
+        try     { az term accept --publisher nerdio --product nmm --plan nmm-plan --only-show-errors -o none 2>&1 }
+        finally { $env:AZURE_EXTENSION_USE_DYNAMIC_INSTALL = $prevDyn }
+    } }
+)
+$termsOk = $false; $termsErrors = @()
+foreach ($m in $termsMethods) {
+    $termsOutput = & $m.Run
+    $termsCode   = $LASTEXITCODE
+    $accepted    = Test-NmmTermsAccepted
+    # Success if the command worked and the agreement isn't shown as unaccepted, or if it's accepted regardless
+    if (($termsCode -eq 0 -and $accepted -ne $false) -or $accepted -eq $true) {
+        $termsOk = $true
+        $how = if ($termsCode -ne 0) { 'already accepted' } elseif ($accepted) { 'confirmed' } else { "couldn't confirm with 'terms show'" }
+        Write-Host ("Marketplace terms accepted ({0}; {1})." -f $m.Name, $how) -ForegroundColor Green
+        $script:report.deployment.marketplaceTerms = $m.Name
+        break
+    }
+    $why = (($termsOutput | Out-String) -replace '\s+', ' ').Trim()
+    if (-not $why) { $why = "exit code $termsCode, agreement still not accepted" }
+    $termsErrors += ("{0}: {1}" -f $m.Name, $why)
+    Write-Host ("  {0} didn't accept the terms: {1}" -f $m.Name, $why) -ForegroundColor DarkYellow
+}
+if (-not $termsOk) {
+    $script:report.deployment.marketplaceTerms = 'failed'
+    Write-Warning "Could not accept the marketplace terms with either method."
     Write-Warning "If deployment fails with MarketplacePurchaseEligibilityFailed, the subscription type may not allow marketplace purchases (e.g. CSP/MSDN/sponsored), or a private marketplace policy may be blocking the publisher."
 }
 
@@ -1591,7 +1739,7 @@ try {
         -Name $deploymentName `
         -ResourceGroupName $ResourceGroupName `
         -TemplateFile $templatePath `
-        -TemplateParameterObject @{ sqlServerPassword = $SqlPassword; packageVersion = $NmmVersion } `
+        -TemplateParameterObject @{ sqlServerPassword = $SqlPassword } `
         -AsJob -ErrorAction Stop
 } catch {
     Write-Host "Could not start the deployment: $_" -ForegroundColor Red
@@ -1666,10 +1814,9 @@ if (-not $deployOk) {
 # ====================================================================
 #  Phase 5: Post-install configuration
 # ====================================================================
-# Fetches a configuration script from Nerdio's maintenance endpoint (keyed to
-# the NMM package version) and runs it against this install. The script
-# version is pinned to $NmmVersion so it always matches the package deployed
-# by the inline template (packageVersion).
+# Fetches a configuration script from Nerdio's maintenance endpoint for the
+# latest NMM release (looked up at run time, unlike the fixed 6.8.0 marketplace
+# template version) and runs it against this install.
 Write-Banner "Phase 5: Post-Install Configuration"
 
 # The managed app lives in $ResourceGroupName; its app components (incl. the
@@ -1713,15 +1860,50 @@ if ($ready) {
     Write-Warning "Web app didn't respond within 20 minutes. Trying the post-install configuration anyway."
 }
 
-$maintUri  = "https://nmm-live-maintenance.azurewebsites.net/api/packages/$NmmVersion/script/install"
+$maintBase = 'https://nmm-live-maintenance.azurewebsites.net/api/packages'
 $maintBody = @{
     app   = $webapp.Name
     rg    = $managedRg
     subId = $subId
 } | ConvertTo-Json -Compress
 
+# NMM release for the post-install script: -NmmVersion if pinned, else the latest from Nerdio's
+# release list. The list isn't ordered, so take the highest released version. Assign before piping:
+# Invoke-RestMethod emits the JSON array as one object. ($postVersion, not $nmmVersion: PowerShell
+# variable names are case-insensitive, so that would overwrite the -NmmVersion parameter.)
+$postVersion = $NmmVersion
+for ($attempt = 1; $attempt -le 3 -and -not $postVersion; $attempt++) {
+    try {
+        $releases   = Invoke-RestMethod -Uri $maintBase -TimeoutSec 30 -ErrorAction Stop
+        $now        = (Get-Date).ToUniversalTime()
+        $postVersion = @($releases | Where-Object { ($_.version -as [version]) -and (ConvertTo-UtcDate $_.releaseDate) -le $now } |
+            Sort-Object { [version]$_.version } -Descending | Select-Object -First 1).version
+    } catch {
+        if ($attempt -lt 3) { Start-Sleep -Seconds 10 }
+    }
+}
+if (-not $postVersion) {
+    Write-Host "Couldn't look up the latest NMM version from $maintBase, so the post-install configuration was not run." -ForegroundColor Red
+    Write-Host "Run it manually in Cloud Shell once that URL responds, replacing <version> with the highest version it lists:" -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host ("& ([ScriptBlock]::Create((Invoke-RestMethod '{0}/<version>/script/install' -Method POST -Body '{1}' -ContentType 'application/json')))" -f $maintBase, $maintBody) -ForegroundColor Gray
+    Write-Host ""
+    Save-Report
+    if ($JsonOut) { Write-Host ("JSON report: {0}" -f $JsonOut) -ForegroundColor Cyan }
+    return
+}
+$maintUri = "$maintBase/$postVersion/script/install"
+$script:report.deployment.nmmVersion = $postVersion
+
 Write-Host ("Target app   : {0}" -f $webapp.Name) -ForegroundColor DarkGray
 Write-Host ("Managed RG   : {0}" -f $managedRg)    -ForegroundColor DarkGray
+$verNote = if ($NmmVersion) { 'pinned with -NmmVersion' } else { 'latest release' }
+Write-Host ("NMM version  : {0} ({1})" -f $postVersion, $verNote) -ForegroundColor DarkGray
+Write-Host ''
+Write-Host "Next: downloading and running Nerdio's NMM post-install configuration script from a remote location." -ForegroundColor Cyan
+Write-Host "This is the command being run:" -ForegroundColor Cyan
+Write-Host ("  & ([ScriptBlock]::Create((Invoke-RestMethod '{0}' -Method POST -Body '{1}' -ContentType 'application/json')))" -f $maintUri, $maintBody)
+Write-Host ''
 Write-Host "Fetching and running NMM post-install configuration script..." -ForegroundColor Cyan
 try {
     $maintScript = Invoke-RestMethod -Uri $maintUri -Method POST -Body $maintBody -ContentType 'application/json' -ErrorAction Stop
