@@ -14,7 +14,7 @@ param(
     [switch]$PolicyProbe,
     [switch]$RegisterProviders,
     [int]$ProviderTimeoutMinutes = 15,
-    [string]$NmmVersion,         # pin the post-install NMM release; default is the latest (template stays 6.8.0)
+    [string]$NmmVersion,         # pin the post-install NMM release; default is the latest (template stays 7.4.0)
     [switch]$CheckOnly,
     [switch]$Force
 )
@@ -100,7 +100,7 @@ $DeployWindowMins  = 75    # an NMM deploy + post-install takes ~45-60 min; warn
 # ====================================================================
 # Embedded so the script is a single self-contained file -- works with a
 # Cloud Shell curl-pipe / one-liner and from any working directory (no
-# companion template.json to ship). The plan version (6.8.0) is the Azure
+# companion template.json to ship). The plan version (7.4.0) is the Azure
 # Marketplace template version, which doesn't track NMM releases, so it's fixed
 # here. The Phase 5 post-install configuration uses the latest NMM release.
 # Single-quoted here-string: no PowerShell interpolation of the ARM '$schema' /
@@ -142,7 +142,7 @@ $nmmTemplateJson = @'
                 "name": "nmm-plan",
                 "product": "nmm",
                 "publisher": "nerdio",
-                "version": "6.8.0"
+                "version": "7.4.0"
             },
             "properties": {
                 "managedResourceGroupId": "[concat(subscription().id,'/resourceGroups/',take(concat(resourceGroup().name,'-',uniquestring(resourceGroup().id),uniquestring(parameters('applicationResourceName'))),90))]",
@@ -993,7 +993,7 @@ Write-Banner "Nerdio Manager for MSP (NMM) - Pre-Install Readiness Check"
 Write-Host ("Subscription : {0}" -f $ctx.name)
 Write-Host ("Sub ID       : {0}" -f $ctx.id)
 Write-Host ("Checking for : App Service '{0}' x{1} (quota)  +  Azure SQL '{2}/{3}'" -f $AppServiceSku, $AppServiceInstances, $SqlEdition, $SqlServiceObjective)
-Write-Host ("NMM version  : {0}, installed by the post-install step (Marketplace template: 6.8.0)" -f $nmmLabel)
+Write-Host ("NMM version  : {0}, installed by the post-install step (Marketplace template: 7.4.0)" -f $nmmLabel)
 if ($CheckOnly) { Write-Host "Mode         : check only (no changes to the subscription)" -ForegroundColor DarkGray }
 if ($Force)     { Write-Host "-Force       : readiness gates will be bypassed." -ForegroundColor DarkYellow }
 Write-Host ''
@@ -1616,7 +1616,7 @@ while ($true) {
     } elseif ($sel.Eligible -eq 'UNVERIFIED') {
         Write-Host "                   unverified: App Service quota couldn't be confirmed here, so the deployment might fail" -ForegroundColor DarkYellow
     }
-    Write-Host ("  NMM version    : {0}, installed by the post-install step (Marketplace template: 6.8.0)" -f $nmmLabel)
+    Write-Host ("  NMM version    : {0}, installed by the post-install step (Marketplace template: 7.4.0)" -f $nmmLabel)
     Write-Host ("  App Service    : {0} x{1}    Azure SQL : {2}/{3}" -f $AppServiceSku, $AppServiceInstances, $SqlEdition, $SqlServiceObjective)
     if ($quotaPlan) {
         Write-Host ("  Quota request  : raise {0} quota in {1} from {2} to {3} (currently {4} used) -- submitted first" -f $AppServiceSku, $Location, $quotaPlan.Current, $quotaPlan.New, $quotaPlan.Used) -ForegroundColor Yellow
@@ -1815,7 +1815,7 @@ if (-not $deployOk) {
 #  Phase 5: Post-install configuration
 # ====================================================================
 # Fetches a configuration script from Nerdio's maintenance endpoint for the
-# latest NMM release (looked up at run time, unlike the fixed 6.8.0 marketplace
+# latest NMM release (looked up at run time, unlike the fixed 7.4.0 marketplace
 # template version) and runs it against this install.
 Write-Banner "Phase 5: Post-Install Configuration"
 
